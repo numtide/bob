@@ -208,6 +208,11 @@ impl Derivation {
 
         p.expect_byte(b')')?;
 
+        // With __structuredAttrs, individual env vars are packed into a
+        // single __json blob. Unpack them so the rest of nix-inc can
+        // access fields uniformly via env.get("crateName") etc.
+        let env = Self::unpack_structured_attrs(env);
+
         Ok(Derivation {
             outputs,
             input_derivations,
@@ -217,6 +222,69 @@ impl Derivation {
             args,
             env,
         })
+    }
+
+    /// Whether this derivation uses __structuredAttrs.
+    pub fn is_structured_attrs(&self) -> bool {
+        self.env.contains_key("__structured_attrs_unpacked")
+    }
+
+    /// When __json is present (__structuredAttrs), parse it and flatten
+    /// string values into the env map so callers can use env.get()
+    /// uniformly. Non-string values (lists, objects) are serialized
+    /// back to JSON strings.
+    fn unpack_structured_attrs(mut env: BTreeMap<String, String>) -> BTreeMap<String, String> {
+        let json_str = match env.get("__json") {
+            Some(s) => s.clone(),
+            None => return env,
+        };
+
+        let obj: serde_json::Value = match serde_json::from_str(&json_str) {
+            Ok(serde_json::Value::Object(map)) => serde_json::Value::Object(map),
+            _ => return env,
+        };
+
+        if let serde_json::Value::Object(map) = obj {
+            for (k, v) in map {
+                // Don't overwrite output paths (out, lib) already in env
+                if env.contains_key(&k) {
+                    continue;
+                }
+                match v {
+                    serde_json::Value::String(s) => {
+                        env.insert(k, s);
+                    }
+                    serde_json::Value::Bool(b) => {
+                        env.insert(k, if b { "1".into() } else { "".into() });
+                    }
+                    serde_json::Value::Number(n) => {
+                        env.insert(k, n.to_string());
+                    }
+                    serde_json::Value::Null => {
+                        env.insert(k, String::new());
+                    }
+                    // String lists: join with spaces (matches bash env var format)
+                    serde_json::Value::Array(ref arr)
+                        if arr.iter().all(|v| v.is_string()) =>
+                    {
+                        let joined = arr
+                            .iter()
+                            .filter_map(|v| v.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        env.insert(k, joined);
+                    }
+                    // Other lists and objects: serialize to JSON string
+                    other => {
+                        env.insert(k, other.to_string());
+                    }
+                }
+            }
+        }
+
+        // Marker so we know structured attrs were unpacked
+        env.insert("__structured_attrs_unpacked".into(), "1".into());
+        env
     }
 
     /// Returns the store paths of all outputs.
@@ -292,6 +360,29 @@ mod tests {
         let input = br#"Derive([("out","/nix/store/x-test","","")],[],["/nix/store/src"],"x86_64-linux","/bin/bash",[],[("script","echo \"hello\nworld\ttab\\done\"")])"#;
         let drv = Derivation::parse(input).unwrap();
         assert_eq!(drv.env["script"], "echo \"hello\nworld\ttab\\done\"");
+    }
+
+    #[test]
+    fn unpack_structured_attrs() {
+        // Simulate a __structuredAttrs drv where env only has __json + outputs
+        let json = r#"{"crateName":"foo","crateVersion":"1.0.0","completeDeps":["/nix/store/a","/nix/store/b"],"release":true,"codegenUnits":16,"configurePhase":"build-rust-crate configure"}"#;
+        let aterm = format!(
+            "Derive([(\"out\",\"/nix/store/x-foo\",\"\",\"\")],[],[\"/nix/store/src\"],\"x86_64-linux\",\"/bin/bash\",[\"-e\",\"build\"],[(\"__json\",\"{}\"),(\"out\",\"/nix/store/x-foo\")])",
+            json.replace('\\', "\\\\").replace('"', "\\\"")
+        );
+        let drv = Derivation::parse(aterm.as_bytes()).unwrap();
+
+        assert!(drv.is_structured_attrs());
+        assert_eq!(drv.env["crateName"], "foo");
+        assert_eq!(drv.env["crateVersion"], "1.0.0");
+        // Lists of strings should be space-separated
+        assert_eq!(drv.env["completeDeps"], "/nix/store/a /nix/store/b");
+        // Booleans: true → "1"
+        assert_eq!(drv.env["release"], "1");
+        // Numbers
+        assert_eq!(drv.env["codegenUnits"], "16");
+        // out should not be overwritten by __json unpacking
+        assert_eq!(drv.env["out"], "/nix/store/x-foo");
     }
 
     #[test]

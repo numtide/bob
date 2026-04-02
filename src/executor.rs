@@ -261,6 +261,26 @@ pub fn build_crate_with_worker(
     script.push_str(&format!("export out='{}'\n", out_dir.display()));
     script.push_str(&format!("export lib='{}'\n", lib_dir.display()));
 
+    // For __structuredAttrs drvs: write the JSON attrs file so
+    // build-rust-crate can read it, with output paths rewritten.
+    if drv.is_structured_attrs() {
+        if let Some(json_str) = drv.env.get("__json") {
+            let json_path = tmp.join(".attrs.json");
+            let rewritten_json = rewrite_structured_attrs_json(
+                json_str,
+                out_dir.to_str().unwrap(),
+                lib_dir.to_str().unwrap(),
+                rewriter,
+            );
+            std::fs::write(&json_path, &rewritten_json)
+                .map_err(|e| format!("writing attrs json: {e}"))?;
+            script.push_str(&format!(
+                "export NIX_ATTRS_JSON_FILE='{}'\n",
+                json_path.display()
+            ));
+        }
+    }
+
     // Enable incremental compilation: rustc reuses previous work
     // from this persistent dir across rebuilds of the same crate.
     let inc_dir = cache.incremental_dir(drv_path);
@@ -336,6 +356,65 @@ echo "__TIMING__ phases=$((_t1-_t0))0ms" >&2
         stdout: result.stdout,
         stderr: result.stderr,
     })
+}
+
+/// Rewrite output paths and dependency paths in the __structuredAttrs JSON
+/// so the build-rust-crate binary sees our cache paths instead of /nix/store.
+fn rewrite_structured_attrs_json(
+    json_str: &str,
+    out_path: &str,
+    lib_path: &str,
+    rewriter: &PathRewriter,
+) -> String {
+    // Parse, rewrite string values, re-serialize
+    let mut val: serde_json::Value = match serde_json::from_str(json_str) {
+        Ok(v) => v,
+        Err(_) => return json_str.to_string(),
+    };
+
+    if let serde_json::Value::Object(ref mut map) = val {
+        // Replace outputs with a proper {name: path} map.
+        // In the __json blob, outputs is just ["out", "lib"] (names only).
+        // The build-rust-crate binary expects {"out": "/path", "lib": "/path"}.
+        let mut outputs_map = serde_json::Map::new();
+        outputs_map.insert("out".into(), serde_json::Value::String(out_path.to_string()));
+        outputs_map.insert("lib".into(), serde_json::Value::String(lib_path.to_string()));
+        map.insert("outputs".into(), serde_json::Value::Object(outputs_map));
+
+        // Rewrite all string values that contain /nix/store paths
+        rewrite_json_values(map, rewriter);
+    }
+
+    serde_json::to_string(&val).unwrap_or_else(|_| json_str.to_string())
+}
+
+fn rewrite_json_values(map: &mut serde_json::Map<String, serde_json::Value>, rewriter: &PathRewriter) {
+    for (_key, val) in map.iter_mut() {
+        match val {
+            serde_json::Value::String(s) => {
+                let rewritten = rewriter.rewrite(s);
+                if rewritten != *s {
+                    *s = rewritten;
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                for item in arr.iter_mut() {
+                    if let serde_json::Value::String(s) = item {
+                        let rewritten = rewriter.rewrite(s);
+                        if rewritten != *s {
+                            *s = rewritten;
+                        }
+                    } else if let serde_json::Value::Object(ref mut inner) = item {
+                        rewrite_json_values(inner, rewriter);
+                    }
+                }
+            }
+            serde_json::Value::Object(ref mut inner) => {
+                rewrite_json_values(inner, rewriter);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Escape a string for bash $'...' quoting.
