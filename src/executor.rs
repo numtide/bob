@@ -13,6 +13,16 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::cache::ArtifactCache;
+
+/// Override for a crate's source and cache key when reusing an old drv
+/// with modified local source (skipping nix-instantiate).
+#[derive(Clone, Debug)]
+pub struct SourceOverride {
+    /// Local source directory to use instead of the store path in the drv.
+    pub src_path: PathBuf,
+    /// Source content hash, mixed into the cache key.
+    pub source_hash: String,
+}
 use crate::drv::Derivation;
 use crate::rewrite::PathRewriter;
 
@@ -186,13 +196,21 @@ pub fn build_crate_with_worker(
     cache: &ArtifactCache,
     rewriter: &PathRewriter,
     worker: &mut crate::worker::Worker,
+    src_override: Option<&SourceOverride>,
 ) -> Result<BuildResult, String> {
+    // When source is overridden, use a different cache key that
+    // incorporates the source hash (the drv_path alone would match
+    // the old, stale artifact).
+    let effective_key = match src_override {
+        Some(ov) => ArtifactCache::cache_key_with_source(drv_path, &ov.source_hash),
+        None => ArtifactCache::cache_key(drv_path),
+    };
     let crate_name = drv.env.get("crateName")
         .cloned()
         .unwrap_or_else(|| "unknown".into());
     let start = std::time::Instant::now();
 
-    if cache.is_cached(drv_path) {
+    if cache.is_cached_key(&effective_key) {
         return Ok(BuildResult {
             drv_path: drv_path.into(),
             crate_name,
@@ -203,8 +221,14 @@ pub fn build_crate_with_worker(
         });
     }
 
-    let tmp = cache.prepare_tmp(drv_path)
-        .map_err(|e| format!("preparing tmp dir: {e}"))?;
+    let tmp_dir = cache.root().join("tmp").join(&effective_key);
+    if tmp_dir.exists() {
+        std::fs::remove_dir_all(&tmp_dir)
+            .map_err(|e| format!("removing old tmp: {e}"))?;
+    }
+    std::fs::create_dir_all(&tmp_dir)
+        .map_err(|e| format!("creating tmp dir: {e}"))?;
+    let tmp = tmp_dir;
     let env = rewriter.rewrite_env(&drv.env);
 
     let out_dir = tmp.join("out");
@@ -228,6 +252,11 @@ pub fn build_crate_with_worker(
             .map_err(|e| format!("writing env file: {e}"))?;
     }
     script.push_str(&format!("source '{}'\n", env_file.display()));
+
+    // Override src with local snapshot when skipping nix-instantiate
+    if let Some(ov) = src_override {
+        script.push_str(&format!("export src='{}'\n", ov.src_path.display()));
+    }
 
     script.push_str(&format!("export out='{}'\n", out_dir.display()));
     script.push_str(&format!("export lib='{}'\n", lib_dir.display()));
@@ -290,7 +319,7 @@ echo "__TIMING__ phases=$((_t1-_t0))0ms" >&2
     if !success {
         let _ = std::fs::remove_dir_all(&tmp);
     } else {
-        cache.commit(drv_path)
+        cache.commit_key(&effective_key)
             .map_err(|e| format!("committing {crate_name} to cache: {e}"))?;
     }
 

@@ -39,9 +39,24 @@ impl ArtifactCache {
         hash.to_hex().to_string()
     }
 
+    /// Cache key that incorporates a source hash suffix.
+    /// Used when reusing an old drv with overridden source.
+    pub fn cache_key_with_source(drv_path: &str, source_hash: &str) -> String {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(drv_path.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(source_hash.as_bytes());
+        hasher.finalize().to_hex().to_string()
+    }
+
     /// Path where a cached artifact lives.
     pub fn artifact_dir(&self, drv_path: &str) -> PathBuf {
         self.root.join("artifacts").join(Self::cache_key(drv_path))
+    }
+
+    /// Path where a cached artifact lives, by raw key.
+    pub fn artifact_dir_by_key(&self, key: &str) -> PathBuf {
+        self.root.join("artifacts").join(key)
     }
 
     /// The "out" output directory for a cached build.
@@ -64,10 +79,20 @@ impl ArtifactCache {
         self.artifact_dir(drv_path).exists()
     }
 
+    /// Check if a build result is cached, by raw key.
+    pub fn is_cached_key(&self, key: &str) -> bool {
+        self.artifact_dir_by_key(key).exists()
+    }
+
     /// Atomically commit a completed build from tmp to artifacts.
     pub fn commit(&self, drv_path: &str) -> Result<(), std::io::Error> {
-        let tmp = self.tmp_dir(drv_path);
-        let dest = self.artifact_dir(drv_path);
+        self.commit_key(&Self::cache_key(drv_path))
+    }
+
+    /// Atomically commit by raw key.
+    pub fn commit_key(&self, key: &str) -> Result<(), std::io::Error> {
+        let tmp = self.root.join("tmp").join(key);
+        let dest = self.artifact_dir_by_key(key);
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }

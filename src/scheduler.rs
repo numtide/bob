@@ -12,7 +12,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 use crate::cache::ArtifactCache;
-use crate::executor;
+use crate::executor::{self, SourceOverride};
 use crate::graph::BuildGraph;
 use crate::progress::Progress;
 
@@ -48,6 +48,7 @@ pub fn run_parallel(
     jobs: usize,
     bash: &str,
     stdenv_path: &str,
+    overrides: &HashMap<String, SourceOverride>,
 ) -> SchedulerResult {
     let start = std::time::Instant::now();
 
@@ -58,9 +59,22 @@ pub fn run_parallel(
     let mut cached = 0;
 
     for (drv_path, node) in &graph.nodes {
-        if cache.is_cached(drv_path) {
+        let is_cached = if let Some(ov) = overrides.get(drv_path) {
+            let key = ArtifactCache::cache_key_with_source(drv_path, &ov.source_hash);
+            cache.is_cached_key(&key)
+        } else {
+            cache.is_cached(drv_path)
+        };
+
+        if is_cached {
+            let artifact = if let Some(ov) = overrides.get(drv_path) {
+                let key = ArtifactCache::cache_key_with_source(drv_path, &ov.source_hash);
+                cache.artifact_dir_by_key(&key)
+            } else {
+                cache.artifact_dir(drv_path)
+            };
             for (name, out) in &node.drv.outputs {
-                output_map.insert(out.path.clone(), cache.artifact_dir(drv_path).join(name));
+                output_map.insert(out.path.clone(), artifact.join(name));
             }
             cached += 1;
             continue;
@@ -122,7 +136,7 @@ pub fn run_parallel(
             s.spawn(move || {
                 let mut worker = crate::worker::Worker::spawn(bash, stdenv_path)
                     .expect("spawning worker");
-                worker_loop(&state, &graph.nodes, cache, &mut worker, &progress);
+                worker_loop(&state, &graph.nodes, cache, &mut worker, &progress, overrides);
             });
         }
     });
@@ -145,6 +159,7 @@ fn worker_loop(
     cache: &ArtifactCache,
     worker: &mut crate::worker::Worker,
     progress: &Progress,
+    overrides: &HashMap<String, SourceOverride>,
 ) {
     let (lock, cvar) = state;
 
@@ -186,7 +201,8 @@ fn worker_loop(
         progress.start(&crate_name);
 
         let rewriter = executor::make_rewriter(&node.drv, &dep_map);
-        let result = executor::build_crate_with_worker(&drv_path, &node.drv, cache, &rewriter, worker);
+        let src_ov = overrides.get(&drv_path);
+        let result = executor::build_crate_with_worker(&drv_path, &node.drv, cache, &rewriter, worker, src_ov);
 
         {
             let mut s = lock.lock().unwrap();

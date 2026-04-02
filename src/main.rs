@@ -123,9 +123,13 @@ fn extract_toml_string_value(line: &str) -> Option<String> {
 
 /// Resolve a build target to a drv path.
 /// Accepts: "." (cwd detection), a member name, or a raw /nix/store/*.drv path.
-fn resolve_target(target: &str, repo_root: &Path, cache: &ArtifactCache) -> Result<String, String> {
+fn resolve_target(target: &str, repo_root: &Path, cache: &ArtifactCache) -> Result<resolve::ResolveResult, String> {
     if target.starts_with("/nix/store/") && target.ends_with(".drv") {
-        return Ok(target.to_string());
+        return Ok(resolve::ResolveResult {
+            drv_path: target.to_string(),
+            src_override: None,
+            source_hash: String::new(),
+        });
     }
 
     let member = if target == "." {
@@ -185,13 +189,11 @@ fn cmd_build(args: &[String]) {
         .or_else(|| find_repo_root().ok())
         .expect("could not find monorepo root — pass --repo-root or cd into the repo");
 
-    // Resolve all targets to drv paths
-    let mut drv_paths: Vec<String> = Vec::new();
+    // Resolve all targets
+    let mut resolve_results: Vec<resolve::ResolveResult> = Vec::new();
     for target in &targets {
         match resolve_target(target, &repo_root, &cache) {
-            Ok(drv) => {
-                drv_paths.push(drv);
-            }
+            Ok(r) => resolve_results.push(r),
             Err(e) => {
                 eprintln!("error resolving '{target}': {e}");
                 std::process::exit(1);
@@ -199,10 +201,25 @@ fn cmd_build(args: &[String]) {
         }
     }
 
+    let drv_paths: Vec<String> = resolve_results.iter().map(|r| r.drv_path.clone()).collect();
     let g = graph::BuildGraph::from_roots(&drv_paths).expect("building graph");
 
     // Realize any missing source tarballs / build inputs
     g.realize_inputs().expect("realizing inputs");
+
+    // Build the overrides map from resolve results
+    let mut overrides = std::collections::HashMap::new();
+    for r in &resolve_results {
+        if let Some(ref src_path) = r.src_override {
+            overrides.insert(
+                r.drv_path.clone(),
+                executor::SourceOverride {
+                    src_path: src_path.clone(),
+                    source_hash: r.source_hash.clone(),
+                },
+            );
+        }
+    }
 
     // Find bash and stdenv from the first crate drv
     let first_drv = g.nodes.values().next().expect("empty graph");
@@ -220,19 +237,32 @@ fn cmd_build(args: &[String]) {
         jobs
     );
 
-    let result = scheduler::run_parallel(&g, &cache, jobs, &bash, &stdenv_path);
+    let result = scheduler::run_parallel(&g, &cache, jobs, &bash, &stdenv_path, &overrides);
 
     // Show output binaries for root crates
-    for drv_path in &drv_paths {
-        let bins = find_output_binaries(&cache, drv_path);
+    for r in &resolve_results {
+        let artifact = if let Some(ref src_path) = r.src_override {
+            let key = ArtifactCache::cache_key_with_source(&r.drv_path, &r.source_hash);
+            cache.artifact_dir_by_key(&key)
+        } else {
+            cache.artifact_dir(&r.drv_path)
+        };
+        let out_bin = artifact.join("out").join("bin");
+        let mut bins = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&out_bin) {
+            for entry in entries.flatten() {
+                if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                    bins.push(entry.path());
+                }
+            }
+        }
         if !bins.is_empty() {
             for bin in &bins {
                 eprintln!("   \x1b[1;32mOutput\x1b[0m {}", bin.display());
             }
 
-            // Create ./result symlink pointing to the artifact out dir
-            if drv_paths.len() == 1 {
-                let out_dir = cache.artifact_dir(drv_path).join("out");
+            if resolve_results.len() == 1 {
+                let out_dir = artifact.join("out");
                 let link = std::env::current_dir()
                     .unwrap_or_else(|_| PathBuf::from("."))
                     .join("result");
@@ -291,9 +321,9 @@ fn cmd_clean(args: &[String]) {
     let eval_cache = resolve::EvalCache::new(cache.root());
 
     match eval_cache.resolve_one(&repo_root, member) {
-        Ok(drv_path) => {
-            let artifact = cache.artifact_dir(&drv_path);
-            let inc = cache.incremental_dir(&drv_path);
+        Ok(r) => {
+            let artifact = cache.artifact_dir(&r.drv_path);
+            let inc = cache.incremental_dir(&r.drv_path);
             let mut cleaned = false;
 
             if artifact.exists() {
