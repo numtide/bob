@@ -14,13 +14,23 @@ use std::process::Command;
 
 use crate::cache::ArtifactCache;
 
-/// Override for a crate's source and cache key when reusing an old drv
-/// with modified local source (skipping nix-instantiate).
+/// Override for a crate's cache key (and optionally its source) when reusing
+/// a cached drv whose inputs have effectively changed.
+///
+/// `source_hash` is the *effective* hash: it incorporates this crate's own
+/// source content AND the effective hashes of all its workspace deps. This
+/// cascades invalidation through the DAG without changing drv paths, so a
+/// change to `foo/src/lib.rs` produces a new key for foo and
+/// every downstream workspace crate, while crates.io deps (which never sit
+/// downstream of workspace crates) keep their plain `blake3(drv_path)` key.
 #[derive(Clone, Debug)]
 pub struct SourceOverride {
     /// Local source directory to use instead of the store path in the drv.
-    pub src_path: PathBuf,
-    /// Source content hash, mixed into the cache key.
+    /// `None` when only the cache key changes (i.e., this crate's own source
+    /// is unchanged but a dep's effective hash differs) — currently every
+    /// overridden crate is a workspace crate so this is always `Some`.
+    pub src_path: Option<PathBuf>,
+    /// Effective source hash, mixed into the cache key.
     pub source_hash: String,
 }
 use crate::drv::Derivation;
@@ -258,9 +268,10 @@ pub fn build_crate_with_worker(
     }
     script.push_str(&format!("source '{}'\n", env_file.display()));
 
-    // Override src with local snapshot when skipping nix-instantiate
     if let Some(ov) = src_override {
-        script.push_str(&format!("export src='{}'\n", ov.src_path.display()));
+        if let Some(ref p) = ov.src_path {
+            script.push_str(&format!("export src='{}'\n", p.display()));
+        }
     }
 
     script.push_str(&format!("export out='{}'\n", out_dir.display()));
@@ -434,8 +445,14 @@ pub fn build_crate_with_worker_signaled(
     }
     script.push_str(&format!("source '{}'\n", env_file.display()));
 
+    // Override src with local worktree dir when reusing a cached drv across
+    // source changes. unpackPhase will copy it into NIX_BUILD_TOP; the live
+    // dir only ever contains a tiny target/.nix-inc-mtime-cache (cargo's real
+    // target dir is workspace-level), so no filtered snapshot is needed.
     if let Some(ov) = src_override {
-        script.push_str(&format!("export src='{}'\n", ov.src_path.display()));
+        if let Some(ref p) = ov.src_path {
+            script.push_str(&format!("export src='{}'\n", p.display()));
+        }
     }
 
     script.push_str(&format!("export out='{}'\n", out_dir.display()));

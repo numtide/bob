@@ -9,7 +9,8 @@ mod scheduler;
 mod worker;
 
 use cache::ArtifactCache;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -58,8 +59,7 @@ fn print_usage() {
 
 /// Find the monorepo root by walking up from cwd looking for bob.nix.
 fn find_repo_root() -> Result<PathBuf, String> {
-    let mut dir = std::env::current_dir()
-        .map_err(|e| format!("getting cwd: {e}"))?;
+    let mut dir = std::env::current_dir().map_err(|e| format!("getting cwd: {e}"))?;
 
     loop {
         if dir.join("bob.nix").exists() {
@@ -73,8 +73,7 @@ fn find_repo_root() -> Result<PathBuf, String> {
 
 /// Detect workspace member name from cwd by reading Cargo.toml package name.
 fn detect_member_from_cwd() -> Result<String, String> {
-    let cwd = std::env::current_dir()
-        .map_err(|e| format!("getting cwd: {e}"))?;
+    let cwd = std::env::current_dir().map_err(|e| format!("getting cwd: {e}"))?;
 
     // Walk up to find the nearest Cargo.toml with [package]
     let mut dir = cwd.as_path();
@@ -123,12 +122,14 @@ fn extract_toml_string_value(line: &str) -> Option<String> {
 
 /// Resolve a build target to a drv path.
 /// Accepts: "." (cwd detection), a member name, or a raw /nix/store/*.drv path.
-fn resolve_target(target: &str, repo_root: &Path, cache: &ArtifactCache) -> Result<resolve::ResolveResult, String> {
+fn resolve_target(
+    target: &str,
+    repo_root: &Path,
+    cache: &ArtifactCache,
+) -> Result<resolve::ResolveResult, String> {
     if target.starts_with("/nix/store/") && target.ends_with(".drv") {
         return Ok(resolve::ResolveResult {
             drv_path: target.to_string(),
-            src_override: None,
-            source_hash: String::new(),
         });
     }
 
@@ -167,6 +168,7 @@ fn cmd_build(args: &[String]) {
         .unwrap_or(4);
     let mut repo_root: Option<PathBuf> = None;
     let mut targets: Vec<String> = Vec::new();
+    let mut dump_keys = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -179,6 +181,10 @@ fn cmd_build(args: &[String]) {
                 i += 1;
                 repo_root = Some(PathBuf::from(&args[i]));
             }
+            // Print `<effective-cache-key> <crateName> <drv-path>` for every
+            // crate in the graph and exit. Used by the bench harness to seed
+            // workspace crates whose build scripts nix-inc can't replay.
+            "--dump-keys" => dump_keys = true,
             other => targets.push(other.to_string()),
         }
         i += 1;
@@ -207,18 +213,25 @@ fn cmd_build(args: &[String]) {
     // Realize any missing source tarballs / build inputs
     g.realize_inputs().expect("realizing inputs");
 
-    // Build the overrides map from resolve results
-    let mut overrides = std::collections::HashMap::new();
-    for r in &resolve_results {
-        if let Some(ref src_path) = r.src_override {
-            overrides.insert(
-                r.drv_path.clone(),
-                executor::SourceOverride {
-                    src_path: src_path.clone(),
-                    source_hash: r.source_hash.clone(),
-                },
-            );
+    // Build per-crate source overrides with cascading invalidation.
+    // See compute_workspace_overrides() for the algorithm.
+    let overrides = compute_workspace_overrides(&repo_root, &g);
+
+    if dump_keys {
+        for (drv, node) in &g.nodes {
+            let key = match overrides.get(drv) {
+                Some(ov) => ArtifactCache::cache_key_with_source(drv, &ov.source_hash),
+                None => ArtifactCache::cache_key(drv),
+            };
+            let name = node
+                .drv
+                .env
+                .get("crateName")
+                .map(String::as_str)
+                .unwrap_or("?");
+            println!("{key} {name} {drv}");
         }
+        return;
     }
 
     // Find bash and stdenv from the first crate drv
@@ -241,11 +254,12 @@ fn cmd_build(args: &[String]) {
 
     // Show output binaries for root crates
     for r in &resolve_results {
-        let artifact = if let Some(ref src_path) = r.src_override {
-            let key = ArtifactCache::cache_key_with_source(&r.drv_path, &r.source_hash);
-            cache.artifact_dir_by_key(&key)
-        } else {
-            cache.artifact_dir(&r.drv_path)
+        let artifact = match overrides.get(&r.drv_path) {
+            Some(ov) => cache.artifact_dir_by_key(&ArtifactCache::cache_key_with_source(
+                &r.drv_path,
+                &ov.source_hash,
+            )),
+            None => cache.artifact_dir(&r.drv_path),
         };
         let out_bin = artifact.join("out").join("bin");
         let mut bins = Vec::new();
@@ -275,6 +289,127 @@ fn cmd_build(args: &[String]) {
     if result.failed > 0 {
         std::process::exit(1);
     }
+}
+
+/// Compute SourceOverrides for every workspace crate in the graph, with
+/// cascading invalidation through the dependency DAG.
+///
+/// The eval cache reuses a drv keyed only on `Cargo.lock`, so the drv's
+/// baked-in `src` store paths are stale once any workspace source changes.
+/// We fix this by:
+///
+///  1. Hashing each workspace crate's source dir (mtime fast-path, ~0.1ms each).
+///  2. Computing an *effective hash* per crate in topo order:
+///       eff(c) = blake3( own_src_hash(c) ‖ sorted(eff(d) for d in crate_deps(c)) )
+///     Only crates that are workspace members, or depend (transitively) on one,
+///     get an entry. Crates.io deps are leaves w.r.t. workspace crates, so they
+///     stay on the plain `blake3(drv_path)` key and remain seedable from the
+///     nix store.
+///  3. Emitting a SourceOverride for every crate with an effective hash,
+///     pointing `src` at the live worktree dir. The scheduler then uses
+///     `cache_key_with_source(drv, eff)` for these crates: a change to
+///     `foo/src/lib.rs` produces a new key for foo *and* every
+///     downstream workspace crate, while everything else stays cached.
+fn compute_workspace_overrides(
+    repo_root: &Path,
+    g: &graph::BuildGraph,
+) -> std::collections::HashMap<String, executor::SourceOverride> {
+    use std::collections::HashMap;
+
+    // crateName (== Cargo.toml [package].name) → drv_path. If the same name
+    // appears in both the workspace and crates.io (it shouldn't), prefer the
+    // 0.0.0 version which is how cargoNix tags local crates.
+    let is_local = |drv: &str| {
+        g.nodes[drv]
+            .drv
+            .env
+            .get("version")
+            .map(|v| v == "0.0.0")
+            .unwrap_or(false)
+    };
+    let mut name_to_drv: HashMap<String, String> = HashMap::new();
+    for (drv, node) in &g.nodes {
+        let Some(name) = node.drv.env.get("crateName") else { continue };
+        let local = is_local(drv);
+        match name_to_drv.get(name) {
+            Some(_) if !local => {}
+            Some(prev) if is_local(prev) => {
+                // Resolver v1 unifies workspace features so this shouldn't
+                // happen today. If crate2nix ever emits two feature-variant
+                // drvs for one workspace member, the loser would silently
+                // miss its own_hash and serve stale source on edits.
+                eprintln!(
+                    "  warn: workspace crate '{name}' has multiple drvs ({prev} and {drv}); \
+                     source-change tracking will only cover one"
+                );
+                name_to_drv.insert(name.clone(), drv.clone());
+            }
+            _ => {
+                name_to_drv.insert(name.clone(), drv.clone());
+            }
+        }
+    }
+
+    // Per-workspace-crate own source hash + live src dir.
+    let mut own_hash: HashMap<String, String> = HashMap::new();
+    let mut src_dir: HashMap<String, PathBuf> = HashMap::new();
+    if let Ok(members) = resolve::EvalCache::workspace_members(repo_root) {
+        for (name, rel) in &members {
+            if let Some(drv) = name_to_drv.get(name) {
+                match resolve::EvalCache::source_hash(repo_root, rel) {
+                    Ok(h) => {
+                        own_hash.insert(drv.clone(), h);
+                        src_dir.insert(drv.clone(), repo_root.join(rel));
+                    }
+                    Err(e) => eprintln!("  warn: hashing {}: {e}", rel.display()),
+                }
+            }
+        }
+    }
+
+    // Effective hash in topo order (deps before dependents).
+    let mut eff: HashMap<String, String> = HashMap::new();
+    for drv in &g.topo_order {
+        let node = &g.nodes[drv];
+        let own = own_hash.get(drv);
+        let mut dep_effs: Vec<&str> = node
+            .crate_deps
+            .iter()
+            .filter_map(|d| eff.get(d).map(String::as_str))
+            .collect();
+        if own.is_none() && dep_effs.is_empty() {
+            // Pure crates.io subgraph — stable, plain key.
+            continue;
+        }
+        dep_effs.sort_unstable();
+        let mut h = blake3::Hasher::new();
+        if let Some(o) = own {
+            h.update(o.as_bytes());
+        }
+        for d in dep_effs {
+            h.update(b"\0");
+            h.update(d.as_bytes());
+        }
+        eff.insert(drv.clone(), h.finalize().to_hex()[..32].to_string());
+    }
+
+    let count = eff.len();
+    let overrides: HashMap<String, executor::SourceOverride> = eff
+        .into_iter()
+        .map(|(drv, hash)| {
+            let ov = executor::SourceOverride {
+                src_path: src_dir.get(&drv).cloned(),
+                source_hash: hash,
+            };
+            (drv, ov)
+        })
+        .collect();
+
+    eprintln!(
+        "  \x1b[2mTracking {} workspace crate(s) for source changes\x1b[0m",
+        count
+    );
+    overrides
 }
 
 fn cmd_clean(args: &[String]) {
@@ -329,13 +464,21 @@ fn cmd_clean(args: &[String]) {
             if artifact.exists() {
                 let size = dir_size(&artifact);
                 std::fs::remove_dir_all(&artifact).expect("removing artifact");
-                eprintln!("removed artifact: {} ({})", artifact.display(), format_size(size));
+                eprintln!(
+                    "removed artifact: {} ({})",
+                    artifact.display(),
+                    format_size(size)
+                );
                 cleaned = true;
             }
             if inc.exists() {
                 let size = dir_size(&inc);
                 std::fs::remove_dir_all(&inc).expect("removing incremental");
-                eprintln!("removed incremental: {} ({})", inc.display(), format_size(size));
+                eprintln!(
+                    "removed incremental: {} ({})",
+                    inc.display(),
+                    format_size(size)
+                );
                 cleaned = true;
             }
             if !cleaned {
@@ -462,9 +605,7 @@ fn walkdir(path: &Path) -> u64 {
         for entry in entries.flatten() {
             let ft = entry.file_type().unwrap_or_else(|_| {
                 // fallback: treat as file
-                std::fs::metadata(entry.path())
-                    .unwrap()
-                    .file_type()
+                std::fs::metadata(entry.path()).unwrap().file_type()
             });
             if ft.is_dir() {
                 total += walkdir(&entry.path());

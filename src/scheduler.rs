@@ -59,6 +59,18 @@ pub fn run_parallel(
 ) -> SchedulerResult {
     let start = std::time::Instant::now();
 
+    // Override-aware helpers. Any drv with a SourceOverride uses a composite
+    // cache key (drv_path + effective source hash); plain `is_cached(drv)` would
+    // wrongly hit the stale pre-override artifact.
+    let key_for = |drv: &str| -> String {
+        match overrides.get(drv) {
+            Some(ov) => ArtifactCache::cache_key_with_source(drv, &ov.source_hash),
+            None => ArtifactCache::cache_key(drv),
+        }
+    };
+    let is_cached = |drv: &str| cache.is_cached_key(&key_for(drv));
+    let artifact_dir = |drv: &str| cache.artifact_dir_by_key(&key_for(drv));
+
     let mut pending_deps: HashMap<String, usize> = HashMap::new();
     let mut dependents: HashMap<String, Vec<String>> = HashMap::new();
     let mut needs_full_build: HashMap<String, HashSet<String>> = HashMap::new();
@@ -89,20 +101,8 @@ pub fn run_parallel(
     }
 
     for (drv_path, node) in &graph.nodes {
-        let is_cached = if let Some(ov) = overrides.get(drv_path) {
-            let key = ArtifactCache::cache_key_with_source(drv_path, &ov.source_hash);
-            cache.is_cached_key(&key)
-        } else {
-            cache.is_cached(drv_path)
-        };
-
-        if is_cached {
-            let artifact = if let Some(ov) = overrides.get(drv_path) {
-                let key = ArtifactCache::cache_key_with_source(drv_path, &ov.source_hash);
-                cache.artifact_dir_by_key(&key)
-            } else {
-                cache.artifact_dir(drv_path)
-            };
+        if is_cached(drv_path) {
+            let artifact = artifact_dir(drv_path);
             for (name, out) in &node.drv.outputs {
                 output_map.insert(out.path.clone(), artifact.join(name));
             }
@@ -130,15 +130,10 @@ pub fn run_parallel(
             }
         }
 
-        let uncached_deps: Vec<&String> = node.crate_deps.iter()
-            .filter(|dep| {
-                if let Some(ov) = overrides.get(*dep) {
-                    let key = ArtifactCache::cache_key_with_source(dep, &ov.source_hash);
-                    !cache.is_cached_key(&key)
-                } else {
-                    !cache.is_cached(dep)
-                }
-            })
+        let uncached_deps: Vec<&String> = node
+            .crate_deps
+            .iter()
+            .filter(|dep| !is_cached(dep))
             .collect();
 
         pending_deps.insert(drv_path.clone(), uncached_deps.len());
@@ -300,15 +295,13 @@ fn worker_loop(
                     s.succeeded += 1;
                     progress.finish(&crate_name, r.duration);
 
-                    let effective_key = match overrides.get(&drv_path) {
+                    let key = match overrides.get(&drv_path) {
                         Some(ov) => ArtifactCache::cache_key_with_source(&drv_path, &ov.source_hash),
                         None => ArtifactCache::cache_key(&drv_path),
                     };
+                    let artifact = cache.artifact_dir_by_key(&key);
                     for (name, out) in &node.drv.outputs {
-                        s.output_map.insert(
-                            out.path.clone(),
-                            cache.artifact_dir_by_key(&effective_key).join(name),
-                        );
+                        s.output_map.insert(out.path.clone(), artifact.join(name));
                     }
 
                     // Full build done: unlock dependents that need full
