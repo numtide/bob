@@ -77,6 +77,7 @@ Parse and dump a `.drv` file's contents (outputs, env vars, deps). Useful for de
 
 Benchmarked with [hyperfine](https://github.com/sharkdp/hyperfine) on `example` (201 crates / 971 bazel actions), 64-core machine:
 
+
 | Scenario | nix-inc | bazel | Relative |
 |----------|---------|-------|----------|
 | Clean build (cold cache) | **42s** | 76s | **nix-inc 1.8× faster** |
@@ -84,6 +85,7 @@ Benchmarked with [hyperfine](https://github.com/sharkdp/hyperfine) on `example` 
 | Incremental (1 crate changed) | **2.1s** | 2.6s | **nix-inc 1.2× faster** |
 
 nix-inc wins all three scenarios. For incremental rebuilds, when deps haven't changed (Cargo.lock stable), nix-inc reuses the previous drv and overrides `src` with a local snapshot, skipping the 2s `nix-instantiate` eval entirely. The remaining 2.1s is pure rustc compilation. Bazel's sandbox overhead accounts for the 0.5s difference in the incremental case.
+
 
 Run the benchmark yourself:
 
