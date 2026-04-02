@@ -202,7 +202,7 @@ fn cmd_build(args: &[String]) {
     }
 
     let drv_paths: Vec<String> = resolve_results.iter().map(|r| r.drv_path.clone()).collect();
-    let g = graph::BuildGraph::from_roots(&drv_paths).expect("building graph");
+    let g = graph::BuildGraph::from_roots_cached(&drv_paths, cache.root()).expect("building graph");
 
     // Realize any missing source tarballs / build inputs
     g.realize_inputs().expect("realizing inputs");

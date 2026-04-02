@@ -81,7 +81,7 @@ Benchmarked with [hyperfine](https://github.com/sharkdp/hyperfine) on `example` 
 | Scenario | nix-inc | bazel | Relative |
 |----------|---------|-------|----------|
 | Clean build (cold cache) | **42s** | 76s | **nix-inc 1.8× faster** |
-| No-op rebuild (cached) | **69ms** | 265ms | **nix-inc 3.8× faster** |
+| No-op rebuild (cached) | **15ms** | 265ms | **nix-inc 17× faster** |
 | Incremental (1 crate changed) | **2.1s** | 2.6s | **nix-inc 1.2× faster** |
 
 nix-inc wins all three scenarios. For incremental rebuilds, when deps haven't changed (Cargo.lock stable), nix-inc reuses the previous drv and overrides `src` with a local snapshot, skipping the 2s `nix-instantiate` eval entirely. The remaining 2.1s is pure rustc compilation. Bazel's sandbox overhead accounts for the 0.5s difference in the incremental case.

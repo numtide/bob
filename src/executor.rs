@@ -299,8 +299,13 @@ for p in $nativeBuildInputs $depsBuildBuild; do
 done
 "#);
 
-    // Timing + build
+    // Use genericBuild but skip the per-phase overhead (dumpVars,
+    // showPhaseHeader/Footer, date calls) by overriding those to no-ops.
     script.push_str(r#"
+dumpVars() { :; }
+showPhaseHeader() { :; }
+showPhaseFooter() { :; }
+
 _ms() { read _s _ < /proc/uptime; echo "${_s/./}"; }
 _t0=$(_ms)
 genericBuild

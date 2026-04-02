@@ -76,14 +76,44 @@ impl EvalCache {
     }
 
     /// Hash a crate's source directory to detect file changes.
+    /// Uses a two-level approach: first hashes mtimes (fast ~0.1ms),
+    /// then only reads file contents if the mtime hash changed since
+    /// last time (cached in `eval/mtime-<dir-hash>`).
     fn source_hash(repo_root: &Path, crate_dir: &Path) -> Result<String, String> {
-        let mut hasher = blake3::Hasher::new();
-
         let abs_dir = repo_root.join(crate_dir);
         let mut files: Vec<PathBuf> = Vec::new();
         collect_files(&abs_dir, &mut files);
         files.sort();
 
+        // Fast path: hash file paths + mtimes + sizes
+        let mut mtime_hasher = blake3::Hasher::new();
+        for file in &files {
+            let rel = file.strip_prefix(&abs_dir).unwrap_or(file);
+            mtime_hasher.update(rel.to_string_lossy().as_bytes());
+            if let Ok(meta) = std::fs::metadata(file) {
+                use std::os::unix::fs::MetadataExt;
+                mtime_hasher.update(&meta.mtime().to_le_bytes());
+                mtime_hasher.update(&meta.mtime_nsec().to_le_bytes());
+                mtime_hasher.update(&meta.size().to_le_bytes());
+            }
+        }
+        let mtime_key = mtime_hasher.finalize().to_hex()[..32].to_string();
+
+        // Check if we already computed a content hash for this mtime snapshot
+        let mtime_cache_path = abs_dir
+            .join("target")
+            .join(".nix-inc-mtime-cache");
+        if let Ok(cached) = std::fs::read_to_string(&mtime_cache_path) {
+            // Format: "<mtime_key> <content_hash>"
+            if let Some((mk, ch)) = cached.split_once(' ') {
+                if mk == mtime_key {
+                    return Ok(ch.trim().to_string());
+                }
+            }
+        }
+
+        // Slow path: hash actual file contents
+        let mut hasher = blake3::Hasher::new();
         for file in &files {
             let rel = file.strip_prefix(&abs_dir).unwrap_or(file);
             hasher.update(rel.to_string_lossy().as_bytes());
@@ -91,8 +121,13 @@ impl EvalCache {
                 .map_err(|e| format!("reading {}: {e}", file.display()))?;
             hasher.update(&contents);
         }
+        let content_hash = hasher.finalize().to_hex()[..32].to_string();
 
-        Ok(hasher.finalize().to_hex()[..32].to_string())
+        // Cache the mtime→content mapping
+        let _ = std::fs::create_dir_all(mtime_cache_path.parent().unwrap());
+        let _ = std::fs::write(&mtime_cache_path, format!("{mtime_key} {content_hash}"));
+
+        Ok(content_hash)
     }
 
     /// Load a cached drv path for a given (member, lock_hash, source_hash).
