@@ -6,6 +6,16 @@
 //! Per-build stdout/stderr are redirected to temp files to avoid interleaving.
 //!
 //! This saves ~40ms per crate (stdenv sourcing cost).
+//!
+//! ## Pipelining protocol
+//!
+//! The worker saves its stdout as fd 3 (`exec 3>&1`). Subshells inherit
+//! this fd, so build tools can write signals mid-build:
+//!
+//!   `__META_READY__ <rmeta_dir>\n`  — .rmeta files are available
+//!
+//! The Rust side reads lines from worker stdout, dispatching intermediate
+//! signals before the final `__DONE__ <exit_code>`.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -22,6 +32,8 @@ pub struct WorkerBuildResult {
     pub exit_code: i32,
     pub stdout: String,
     pub stderr: String,
+    /// If the build signaled metadata readiness mid-build, the rmeta dir.
+    pub rmeta_dir: Option<PathBuf>,
 }
 
 impl Worker {
@@ -32,9 +44,11 @@ impl Worker {
         // The parent bash:
         // 1. Sets minimal env for stdenv sourcing
         // 2. Sources stdenv/setup (populates PATH, defines genericBuild, hooks, etc.)
-        // 3. Reads script paths from stdin, one per line
-        // 4. For each: forks a subshell with output redirected to temp files
-        // 5. Prints __DONE__ <exit_code> on its stdout
+        // 3. Saves stdout as fd 3 for mid-build signaling
+        // 4. Reads script paths from stdin, one per line
+        // 5. For each: forks a subshell with output redirected to temp files,
+        //    but fd 3 passed through for signaling
+        // 6. Prints __DONE__ <exit_code> on its stdout
         let init = format!(
             r#"
 export out=/dev/null
@@ -49,12 +63,17 @@ mkdir -p "$NIX_BUILD_TOP"
 
 source "{setup}"
 
+# Save stdout as fd 3 for mid-build signaling.
+# Subshells inherit fd 3 so build tools can write
+# __META_READY__ messages directly to the Rust reader.
+exec 3>&1
+
 echo "__READY__"
 
 while IFS= read -r line; do
     # line format: <script_path> <stdout_file> <stderr_file>
     read -r script_path stdout_file stderr_file <<< "$line"
-    ( source "$script_path" ) > "$stdout_file" 2> "$stderr_file"
+    ( source "$script_path" ) > "$stdout_file" 2> "$stderr_file" 3>&3
     echo "__DONE__ $?"
 done
 "#
@@ -86,18 +105,25 @@ done
     /// Execute a build script in a forked subshell.
     /// `script_path` is the path to the crate's builder.sh.
     /// `tmp_dir` is where stdout/stderr temp files go.
-    pub fn execute(&mut self, script_path: &Path, tmp_dir: &Path) -> Result<WorkerBuildResult, String> {
+    ///
+    /// Returns after `__DONE__`, but may receive `__META_READY__` mid-build.
+    /// The caller can provide an `on_meta_ready` callback that fires when
+    /// metadata becomes available (before the full build finishes).
+    pub fn execute_with_signal(
+        &mut self,
+        script_path: &Path,
+        tmp_dir: &Path,
+        on_meta_ready: impl FnOnce(PathBuf),
+    ) -> Result<WorkerBuildResult, String> {
         let stdout_file = tmp_dir.join("worker-stdout");
         let stderr_file = tmp_dir.join("worker-stderr");
 
-        // Ensure temp files exist (subshell redirect needs them)
         std::fs::write(&stdout_file, b"").map_err(|e| format!("creating stdout file: {e}"))?;
         std::fs::write(&stderr_file, b"").map_err(|e| format!("creating stderr file: {e}"))?;
 
         let stdin = self.child.stdin.as_mut()
             .ok_or("worker stdin closed")?;
 
-        // Send: script_path stdout_file stderr_file
         writeln!(stdin, "{} {} {}",
             script_path.display(),
             stdout_file.display(),
@@ -105,21 +131,42 @@ done
         ).map_err(|e| format!("writing to worker: {e}"))?;
         stdin.flush().map_err(|e| format!("flushing worker stdin: {e}"))?;
 
-        // Read __DONE__ <exit_code>
-        let mut line = String::new();
-        self.reader.read_line(&mut line)
-            .map_err(|e| format!("reading worker result: {e}"))?;
+        let mut rmeta_dir = None;
+        let mut callback = Some(on_meta_ready);
 
-        let exit_code = if let Some(code_str) = line.strip_prefix("__DONE__ ") {
-            code_str.trim().parse::<i32>().unwrap_or(-1)
-        } else {
-            return Err(format!("unexpected worker output: {line}"));
-        };
+        // Read lines until __DONE__, handling intermediate signals
+        loop {
+            let mut line = String::new();
+            self.reader.read_line(&mut line)
+                .map_err(|e| format!("reading worker result: {e}"))?;
 
-        let stdout = std::fs::read_to_string(&stdout_file).unwrap_or_default();
-        let stderr = std::fs::read_to_string(&stderr_file).unwrap_or_default();
+            if let Some(dir_str) = line.strip_prefix("__META_READY__ ") {
+                let dir = PathBuf::from(dir_str.trim());
+                rmeta_dir = Some(dir.clone());
+                if let Some(cb) = callback.take() {
+                    cb(dir);
+                }
+                continue;
+            }
 
-        Ok(WorkerBuildResult { exit_code, stdout, stderr })
+            if let Some(code_str) = line.strip_prefix("__DONE__ ") {
+                let exit_code = code_str.trim().parse::<i32>().unwrap_or(-1);
+                let stdout = std::fs::read_to_string(&stdout_file).unwrap_or_default();
+                let stderr = std::fs::read_to_string(&stderr_file).unwrap_or_default();
+                return Ok(WorkerBuildResult { exit_code, stdout, stderr, rmeta_dir });
+            }
+
+            if line.is_empty() {
+                return Err("worker closed stdout unexpectedly".into());
+            }
+
+            // Unknown line — ignore (could be stray output)
+        }
+    }
+
+    /// Simple execute without mid-build signaling (backward compatible).
+    pub fn execute(&mut self, script_path: &Path, tmp_dir: &Path) -> Result<WorkerBuildResult, String> {
+        self.execute_with_signal(script_path, tmp_dir, |_| {})
     }
 
     /// Check if the worker process is still alive.
