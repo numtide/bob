@@ -18,6 +18,7 @@
 //! signals before the final `__DONE__ <exit_code>`.
 
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
@@ -41,14 +42,12 @@ impl Worker {
     pub fn spawn(bash: &str, stdenv_path: &str) -> Result<Self, String> {
         let setup = format!("{stdenv_path}/setup");
 
-        // The parent bash:
-        // 1. Sets minimal env for stdenv sourcing
-        // 2. Sources stdenv/setup (populates PATH, defines genericBuild, hooks, etc.)
-        // 3. Saves stdout as fd 3 for mid-build signaling
-        // 4. Reads script paths from stdin, one per line
-        // 5. For each: forks a subshell with output redirected to temp files,
-        //    but fd 3 passed through for signaling
-        // 6. Prints __DONE__ <exit_code> on its stdout
+        // The parent bash reads script paths from stdin, forks a subshell per
+        // script with stdout/stderr to temp files (fd 3 passed through for
+        // mid-build __META_READY__ signaling), and reports `__DONE__ <rc>`.
+        // stdenv is sourced inside each build script (after env.sh), not here
+        // — input processing must see the crate's real *Inputs. We pre-source
+        // it once anyway to fail fast if the toolchain is broken.
         let init = format!(
             r#"
 export out=/dev/null
@@ -61,7 +60,7 @@ export TMPDIR=/tmp/nib-worker-$$
 export HOME=/homeless-shelter
 mkdir -p "$NIX_BUILD_TOP"
 
-source "{setup}"
+source "{setup}" 2>/dev/null || true
 
 # Save stdout as fd 3 for mid-build signaling.
 # Subshells inherit fd 3 so build tools can write
@@ -79,14 +78,27 @@ done
 "#
         );
 
-        let mut child = Command::new(bash)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .arg("-c")
-            .arg(&init)
-            .spawn()
-            .map_err(|e| format!("spawning worker: {e}"))?;
+        // Put the worker in its own process group so Drop can kill the whole
+        // tree. Without this, an aborted run leaves orphaned subshells (e.g.
+        // aws-lc-sys mid-cmake) writing into tmp/<key>/ that the next run's
+        // prepare_tmp() removes from under them.
+        let mut child = unsafe {
+            Command::new(bash)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .arg("-c")
+                .arg(&init)
+                .pre_exec(|| {
+                    // setsid(): new session + process group, pgid = pid
+                    if libc::setsid() == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                })
+                .spawn()
+                .map_err(|e| format!("spawning worker: {e}"))?
+        };
 
         let stdout = child.stdout.take().unwrap();
         let mut reader = BufReader::new(stdout);
@@ -177,6 +189,13 @@ done
 
 impl Drop for Worker {
     fn drop(&mut self) {
+        // Closing stdin makes the read loop exit, but any in-flight subshell
+        // (forked before EOF) keeps running. Kill the whole process group so
+        // orphaned builds don't collide with a subsequent run's tmp dirs.
+        let pid = self.child.id() as libc::pid_t;
+        unsafe {
+            libc::kill(-pid, libc::SIGTERM);
+        }
         drop(self.child.stdin.take());
         let _ = self.child.wait();
     }

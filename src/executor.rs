@@ -510,25 +510,47 @@ pub fn build_crate_with_worker_signaled(
     script.push_str("export dontFixup=1\n");
     script.push_str(&format!("cd '{}'\n", work_dir.display()));
 
-    script.push_str(r#"
-for p in $nativeBuildInputs $depsBuildBuild; do
-  if [ -d "$p/bin" ]; then
-    export PATH="$p/bin:$PATH"
-  fi
-done
-"#);
+    // Source $stdenv/setup with this crate's real *Inputs in scope so stdenv's
+    // input-processing machinery runs setup-hooks (cc-wrapper, pkg-config,
+    // python3, rust-bindgen-hook, protobuf, ...). The worker's pre-sourced
+    // stdenv had empty inputs, so PKG_CONFIG_PATH/LIBCLANG_PATH/PYTHONPATH/
+    // NIX_CFLAGS_COMPILE etc. were never set — the previous "PATH=$p/bin"
+    // loop was insufficient and broke every build.rs that probes the system.
+    // Costs ~40ms/crate (what the worker was meant to save), but it's the
+    // only way to avoid a hardcoded env-var whitelist.
+    script.push_str(
+        r#"
+export NIX_STORE=/nix/store
+export NIX_ENFORCE_PURITY=0
+source "$stdenv/setup"
+"#,
+    );
 
-    script.push_str(r#"
+    // Use genericBuild but skip the per-phase overhead (dumpVars,
+    // showPhaseHeader/Footer, date calls) by overriding those to no-ops.
+    //
+    // genericBuild's exit code must be captured explicitly: stdenv/setup turns
+    // on `set -eu`, but buildRustCrate's buildPhase string is run via `eval`
+    // and intermediate `runHook` calls mask failures, so a failed rustc would
+    // fall through to installPhase and exit 0. The timing echo would mask it
+    // either way. `set +e` makes the rc capture deterministic regardless of
+    // what stdenv does to errexit.
+    script.push_str(
+        r#"
 dumpVars() { :; }
 showPhaseHeader() { :; }
 showPhaseFooter() { :; }
 
 _ms() { read _s _ < /proc/uptime; echo "${_s/./}"; }
 _t0=$(_ms)
+set +e
 genericBuild
+rc=$?
 _t1=$(_ms)
 echo "__TIMING__ phases=$((_t1-_t0))0ms" >&2
-"#);
+exit $rc
+"#,
+    );
 
     let script_path = tmp.join("builder.sh");
     std::fs::write(&script_path, &script)
@@ -537,7 +559,24 @@ echo "__TIMING__ phases=$((_t1-_t0))0ms" >&2
     let result = worker.execute_with_signal(&script_path, &tmp, on_meta_ready)
         .map_err(|e| format!("worker build {crate_name}: {e}"))?;
 
-    let success = result.exit_code == 0;
+    // genericBuild's exit code is unreliable across stdenv versions (errexit
+    // interactions with eval'd phases). Belt-and-braces: only accept the
+    // build if installPhase actually populated $lib (rlib/so for lib crates)
+    // or $out/bin (bin-only crates).
+    let lib_populated = std::fs::read_dir(lib_dir.join("lib"))
+        .map(|d| {
+            d.flatten().any(|e| {
+                e.file_name()
+                    .to_str()
+                    .map(|n| n.ends_with(".rlib") || n.ends_with(".so") || n.ends_with(".a"))
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false);
+    let bin_populated = std::fs::read_dir(out_dir.join("bin"))
+        .map(|mut d| d.next().is_some())
+        .unwrap_or(false);
+    let success = result.exit_code == 0 && (lib_populated || bin_populated);
     if !success {
         let _ = std::fs::remove_dir_all(&tmp);
     } else {
