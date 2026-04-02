@@ -287,8 +287,12 @@ fn copy_filtered(src: &Path, dest: &Path) -> Result<(), String> {
                 .map_err(|e| format!("creating dir {}: {e}", dest_path.display()))?;
             copy_filtered(&src_path, &dest_path)?;
         } else {
-            std::fs::copy(&src_path, &dest_path)
-                .map_err(|e| format!("copying {}: {e}", src_path.display()))?;
+            // Prefer hardlinks (instant, no data copy) over full copies.
+            // Falls back to copy if hardlink fails (e.g. cross-device).
+            if std::fs::hard_link(&src_path, &dest_path).is_err() {
+                std::fs::copy(&src_path, &dest_path)
+                    .map_err(|e| format!("copying {}: {e}", src_path.display()))?;
+            }
         }
     }
     Ok(())
