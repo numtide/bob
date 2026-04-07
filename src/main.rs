@@ -5,6 +5,7 @@ mod graph;
 mod progress;
 mod resolve;
 mod rewrite;
+mod rustc_wrap;
 mod scheduler;
 mod worker;
 
@@ -20,6 +21,9 @@ fn main() {
     }
 
     match args[1].as_str() {
+        // Internal: rmeta-pipelining rustc shim. Dispatched first because it's
+        // the hot path — invoked once per rustc call inside builds.
+        "__rustc-wrap" => rustc_wrap::main(&args[2..]),
         "build" => cmd_build(&args[2..]),
         "clean" => cmd_clean(&args[2..]),
         "status" => cmd_status(),
