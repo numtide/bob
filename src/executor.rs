@@ -14,6 +14,25 @@ use std::process::Command;
 
 use crate::cache::ArtifactCache;
 
+/// Per-crate pipelining configuration.
+///
+/// When set, the build wraps `rustc` to emit `metadata,link` and signal
+/// `__META_READY__` on fd 3 as soon as the fat rmeta (with MIR) is written.
+/// The scheduler dispatches that to start dependents before this crate's
+/// codegen finishes (cargo-style pipelining).
+pub struct PipelineConfig {
+    /// Basename of THIS crate's rmeta (`lib{libName}-{metadata}.rmeta`). The
+    /// wrapper only signals when rustc emits exactly this artifact — build
+    /// scripts that probe rustc (`--emit=metadata probe.rs`) emit other rmetas
+    /// that must not fire dependents.
+    pub expected_rmeta: String,
+    /// Additional `(from, to)` rewrites applied AFTER the standard prefix
+    /// rewrites — swaps each in-flight dep's `<dep_tmp>/lib/lib/<f>.rlib` (the
+    /// path that ends up in LIB_RUSTC_OPTS after prefix rewriting) to the
+    /// dep's immutable early-published `<dep_tmp>/rmeta/<f>.rmeta`.
+    pub rmeta_rewrites: Vec<(String, String)>,
+}
+
 /// Override for a crate's cache key (and optionally its source) when reusing
 /// a cached drv whose inputs have effectively changed.
 ///
@@ -394,6 +413,7 @@ pub fn build_crate_with_worker_signaled(
     rewriter: &PathRewriter,
     worker: &mut crate::worker::Worker,
     src_override: Option<&SourceOverride>,
+    pl: &PipelineConfig,
     on_meta_ready: impl FnOnce(PathBuf),
 ) -> Result<BuildResult, String> {
     let effective_key = match src_override {
@@ -405,28 +425,39 @@ pub fn build_crate_with_worker_signaled(
         .unwrap_or_else(|| "unknown".into());
     let start = std::time::Instant::now();
 
-    if cache.is_cached_key(&effective_key) {
-        return Ok(BuildResult {
-            drv_path: drv_path.into(),
-            crate_name,
-            success: true,
-            duration: start.elapsed(),
-            stdout: String::new(),
-            stderr: String::new(),
-            rmeta_dir: None,
-        });
-    }
-
-    // Reuse the same tmp/script setup as build_crate_with_worker
-    let tmp_dir = cache.root().join("tmp").join(&effective_key);
-    if tmp_dir.exists() {
-        std::fs::remove_dir_all(&tmp_dir)
-            .map_err(|e| format!("removing old tmp: {e}"))?;
-    }
-    std::fs::create_dir_all(&tmp_dir)
+    // tmp/<key> is reset by the scheduler under lock (before publishing it via
+    // output_map) so dependents can't see stale bytes. Ensure lib/lib/ exists
+    // too: dependents' configurePhase reaches our rmeta via
+    // `$i/../rmeta/*.rmeta` where `$i = tmp/<key>/lib`, and bash glob can't
+    // resolve `lib/..` if `lib/` itself doesn't exist yet.
+    let tmp = cache.root().join("tmp").join(&effective_key);
+    std::fs::create_dir_all(tmp.join("lib").join("lib"))
         .map_err(|e| format!("creating tmp dir: {e}"))?;
-    let tmp = tmp_dir;
-    let env = rewriter.rewrite_env(&drv.env);
+    let mut env = rewriter.rewrite_env(&drv.env);
+
+    // Swap in-flight deps' .rlib paths for their early-written .rmeta. Applied
+    // AFTER store-prefix rewrites so they match the already-rewritten cache/tmp
+    // paths. Also patch configurePhase's `symlink_dependency` glob so
+    // `-L dependency=target/deps` resolves transitive in-flight crates via
+    // their early rmeta. The rmeta lives at `<dep>/../rmeta/` (not `<dep>/lib/`)
+    // so installPhase's `cp target/lib/* $lib/lib` can't truncate it underneath
+    // a reader.
+    let apply_rmeta_rewrites = |s: &mut String| {
+        for (from, to) in &pl.rmeta_rewrites {
+            if s.contains(from) {
+                *s = s.replace(from, to);
+            }
+        }
+    };
+    for v in env.values_mut() {
+        apply_rmeta_rewrites(v);
+    }
+    if let Some(cp) = env.get_mut("configurePhase") {
+        *cp = cp.replace(
+            "ln -s -f $i/lib/*.rlib $2",
+            "ln -s -f $i/lib/*.rlib $i/lib/*.rmeta $i/../rmeta/*.rmeta $2 2>/dev/null",
+        );
+    }
 
     let out_dir = tmp.join("out");
     let lib_dir = tmp.join("lib");
@@ -461,12 +492,13 @@ pub fn build_crate_with_worker_signaled(
     if drv.is_structured_attrs() {
         if let Some(json_str) = drv.env.get("__json") {
             let json_path = tmp.join(".attrs.json");
-            let rewritten_json = rewrite_structured_attrs_json(
+            let mut rewritten_json = rewrite_structured_attrs_json(
                 json_str,
                 out_dir.to_str().unwrap(),
                 lib_dir.to_str().unwrap(),
                 rewriter,
             );
+            apply_rmeta_rewrites(&mut rewritten_json);
             std::fs::write(&json_path, &rewritten_json)
                 .map_err(|e| format!("writing attrs json: {e}"))?;
             script.push_str(&format!(
@@ -482,15 +514,6 @@ pub fn build_crate_with_worker_signaled(
     script.push_str(&format!(
         "export EXTRA_RUSTC_FLAGS=\"-C incremental={} ${{EXTRA_RUSTC_FLAGS:-}}\"\n",
         inc_dir.display()
-    ));
-
-    // Pipelining: tell build-rust-crate where to emit .rmeta
-    let rmeta_dir = cache.root().join("rmeta").join(&effective_key);
-    std::fs::create_dir_all(&rmeta_dir)
-        .map_err(|e| format!("creating rmeta dir: {e}"))?;
-    script.push_str(&format!(
-        "export NIX_INC_RMETA_DIR='{}'\n",
-        rmeta_dir.display()
     ));
 
     let work_dir = tmp.join("build");
@@ -525,6 +548,51 @@ export NIX_ENFORCE_PURITY=0
 source "$stdenv/setup"
 "#,
     );
+
+    // Pipelining: wrap rustc to emit a fat rmeta early and signal via fd 3.
+    // The wrapper is the nix-inc binary itself (`__rustc-wrap`, see
+    // rustc_wrap.rs), so arg classification, JSON-stderr parsing, and
+    // rmeta→rlib polling happen in Rust without forking jq/cp/mv per line.
+    // This /bin/sh shim just bridges PATH lookup of `rustc` to the subcommand.
+    {
+        let wrapper_dir = tmp.join("rustc-wrap");
+        std::fs::create_dir_all(&wrapper_dir)
+            .map_err(|e| format!("creating wrapper dir: {e}"))?;
+        let wrapper = wrapper_dir.join("rustc");
+        let self_exe = std::env::current_exe()
+            .map_err(|e| format!("resolving self exe: {e}"))?;
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nexec '{}' __rustc-wrap \"$@\"\n",
+                self_exe.display()
+            ),
+        )
+        .map_err(|e| format!("writing rustc wrapper: {e}"))?;
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&wrapper).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&wrapper, perms).ok();
+
+        // Config for rustc_wrap::main(). NIXINC_REAL_RUSTC is resolved AFTER
+        // `source $stdenv/setup` so PATH already has the toolchain.
+        // completeDeps/completeBuildDeps come from env.sh (already rewritten).
+        // Intentionally NOT `NIX_INC_RMETA_DIR`: build-rust-crate keys its
+        // post-build `--emit=metadata` pass + fd-3 signal off that var. The
+        // wrapper already signalled mid-build, so that second rustc call would
+        // be ~50ms of redundant work per crate.
+        script.push_str(&format!(
+            concat!(
+                "export NIXINC_REAL_RUSTC=$(command -v rustc)\n",
+                "export NIXINC_RMETA_DIR='{rmeta_dir}'\n",
+                "export NIXINC_EXPECTED_RMETA='{expected}'\n",
+                "export PATH='{wrap}':$PATH\n",
+            ),
+            rmeta_dir = tmp.join("rmeta").display(),
+            expected = pl.expected_rmeta,
+            wrap = wrapper_dir.display(),
+        ));
+    }
 
     // Use genericBuild but skip the per-phase overhead (dumpVars,
     // showPhaseHeader/Footer, date calls) by overriding those to no-ops.
