@@ -26,6 +26,7 @@ struct Cfg {
     real_rustc: String,
     rmeta_dir: PathBuf,
     expected_rmeta: String,
+    skip_link_pass: bool,
     /// `$completeDeps $completeBuildDeps` — already rewritten to tmp/<k>/lib
     /// for in-flight crates, artifacts/<k>/lib for cached.
     complete_deps: Vec<String>,
@@ -39,6 +40,7 @@ impl Cfg {
             real_rustc: env("NIXINC_REAL_RUSTC"),
             rmeta_dir: PathBuf::from(env("NIXINC_RMETA_DIR")),
             expected_rmeta: env("NIXINC_EXPECTED_RMETA"),
+            skip_link_pass: !env("NIXINC_SKIP_LINK_PASS").is_empty(),
             complete_deps: deps.split_whitespace().map(String::from).collect(),
         }
     }
@@ -313,8 +315,9 @@ pub fn main(argv: &[String]) -> ! {
     // `lib cdylib`/`lib staticlib`: lib half just ran on rmeta deps (signal
     // already fired). Now wait for upstream rlibs and link the dylib half.
     // rustc rejects rmeta deps for any linking crate-type, so this can't be
-    // one pass.
-    let rc2 = if rc == 0 && !c.link_types.is_empty() {
+    // one pass. Skipped for non-root crates — downstream Rust only reads the
+    // rlib, so the `.so` is dead weight unless this crate is the build target.
+    let rc2 = if rc == 0 && !c.link_types.is_empty() && !cfg.skip_link_pass {
         swap_rmeta_args_to_rlib(&mut c.args);
         wait_closure_done_and_relink(&cfg, &c.dep_dirs);
         Command::new(&cfg.real_rustc)

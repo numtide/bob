@@ -137,6 +137,31 @@ impl SharedState {
     }
 }
 
+/// A `lib cdylib` crate's cached artifact may have been committed without the
+/// `.so` (link pass skipped when it was a transitive dep). When it's the root
+/// target, the `.so` IS the product, so an rlib-only artifact is insufficient.
+fn needs_link_output(drv: &Derivation) -> bool {
+    drv.env
+        .get("crateType")
+        .map(|ct| {
+            ct.split_whitespace()
+                .any(|t| matches!(t, "cdylib" | "staticlib"))
+        })
+        .unwrap_or(false)
+}
+
+fn artifact_has_link_output(dir: &std::path::Path) -> bool {
+    std::fs::read_dir(dir.join("lib").join("lib"))
+        .map(|d| {
+            d.flatten().any(|e| {
+                let n = e.file_name();
+                let n = n.to_string_lossy();
+                n.ends_with(".so") || n.ends_with(".a") || n.ends_with(".dylib")
+            })
+        })
+        .unwrap_or(false)
+}
+
 pub fn run_parallel(
     graph: &BuildGraph,
     cache: &ArtifactCache,
@@ -144,7 +169,9 @@ pub fn run_parallel(
     bash: &str,
     stdenv_path: &str,
     overrides: &HashMap<String, SourceOverride>,
+    roots: &[String],
 ) -> SchedulerResult {
+    let roots: HashSet<&str> = roots.iter().map(String::as_str).collect();
     let start = std::time::Instant::now();
 
     // Override-aware helpers. Any drv with a SourceOverride uses a composite
@@ -157,7 +184,17 @@ pub fn run_parallel(
         }
     };
     let artifact_dir = |drv: &str| cache.artifact_dir_by_key(&key_for(drv));
-    let is_cached = |drv: &str| cache.is_cached_key(&key_for(drv));
+    let is_cached = |drv: &str, node: &crate::graph::CrateNode| -> bool {
+        if !cache.is_cached_key(&key_for(drv)) {
+            return false;
+        }
+        // Root cdylib targets must have the .so; a prior non-root run may have
+        // committed rlib-only. Absence isn't an error — just means "rebuild".
+        if roots.contains(drv) && needs_link_output(&node.drv) {
+            return artifact_has_link_output(&artifact_dir(drv));
+        }
+        true
+    };
     let tmp_dir = |drv: &str| cache.root().join("tmp").join(key_for(drv));
 
     let pipelineable: HashMap<String, bool> = graph
@@ -176,7 +213,7 @@ pub fn run_parallel(
     let mut to_build = 0;
 
     for (drv_path, node) in &graph.nodes {
-        if is_cached(drv_path) {
+        if is_cached(drv_path, node) {
             let artifact = artifact_dir(drv_path);
             for (name, out) in &node.drv.outputs {
                 output_map.insert(out.path.clone(), artifact.join(name));
@@ -189,7 +226,7 @@ pub fn run_parallel(
         let uncached_deps: Vec<&String> = node
             .crate_deps
             .iter()
-            .filter(|dep| !is_cached(dep))
+            .filter(|dep| !is_cached(dep, &graph.nodes[dep.as_str()]))
             .collect();
 
         let mut n_rmeta = 0usize;
@@ -254,6 +291,7 @@ pub fn run_parallel(
             let progress = Arc::clone(&progress);
             let pipelineable = &pipelineable;
             let tmp_dir = &tmp_dir;
+            let roots = &roots;
             s.spawn(move || {
                 let mut worker =
                     crate::worker::Worker::spawn(bash, stdenv_path).expect("spawning worker");
@@ -266,6 +304,7 @@ pub fn run_parallel(
                     overrides,
                     pipelineable,
                     tmp_dir,
+                    roots,
                 );
             });
         }
@@ -293,6 +332,7 @@ fn worker_loop(
     overrides: &HashMap<String, SourceOverride>,
     pipelineable: &HashMap<String, bool>,
     tmp_dir: &dyn Fn(&str) -> PathBuf,
+    roots: &HashSet<&str>,
 ) {
     let (lock, cvar) = state;
 
@@ -396,6 +436,9 @@ fn worker_loop(
         let src_ov = overrides.get(&drv_path);
         let pl = PipelineConfig {
             expected_rmeta: lib_filename(&node.drv, "rmeta").unwrap_or_default(),
+            // Only the explicit build targets need their cdylib/staticlib
+            // output; for transitive deps the rlib is all anyone reads.
+            skip_link_pass: !roots.contains(drv_path.as_str()),
             rmeta_rewrites,
         };
         let result = executor::build_crate_with_worker_signaled(

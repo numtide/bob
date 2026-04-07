@@ -254,7 +254,15 @@ fn cmd_build(args: &[String]) {
         jobs
     );
 
-    let result = scheduler::run_parallel(&g, &cache, jobs, &bash, &stdenv_path, &overrides);
+    let result = scheduler::run_parallel(
+        &g,
+        &cache,
+        jobs,
+        &bash,
+        &stdenv_path,
+        &overrides,
+        &drv_paths,
+    );
 
     // Show output binaries for root crates
     for r in &resolve_results {
@@ -333,7 +341,9 @@ fn compute_workspace_overrides(
     };
     let mut name_to_drv: HashMap<String, String> = HashMap::new();
     for (drv, node) in &g.nodes {
-        let Some(name) = node.drv.env.get("crateName") else { continue };
+        let Some(name) = node.drv.env.get("crateName") else {
+            continue;
+        };
         let local = is_local(drv);
         match name_to_drv.get(name) {
             Some(_) if !local => {}

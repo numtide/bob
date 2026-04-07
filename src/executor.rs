@@ -26,6 +26,11 @@ pub struct PipelineConfig {
     /// scripts that probe rustc (`--emit=metadata probe.rs`) emit other rmetas
     /// that must not fire dependents.
     pub expected_rmeta: String,
+    /// Skip the cdylib/staticlib second pass. Set for non-root crates: nothing
+    /// in the dependency path consumes the `.so` (downstream Rust crates only
+    /// read the rlib), so linking it just burns CPU on every iteration. Root
+    /// targets always link — the `.so` IS the product (pyo3 modules).
+    pub skip_link_pass: bool,
     /// Additional `(from, to)` rewrites applied AFTER the standard prefix
     /// rewrites — swaps each in-flight dep's `<dep_tmp>/lib/lib/<f>.rlib` (the
     /// path that ends up in LIB_RUSTC_OPTS after prefix rewriting) to the
@@ -425,6 +430,15 @@ pub fn build_crate_with_worker_signaled(
         .unwrap_or_else(|| "unknown".into());
     let start = std::time::Instant::now();
 
+    // No is_cached short-circuit here: the scheduler already filtered cached
+    // crates, and a root cdylib that was previously committed rlib-only must
+    // be rebuilt even though is_cached_key() returns true. Clear any stale
+    // artifact so the hardlink commit at the end gets a clean destination.
+    let dest = cache.artifact_dir_by_key(&effective_key);
+    if dest.exists() {
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
     // tmp/<key> is reset by the scheduler under lock (before publishing it via
     // output_map) so dependents can't see stale bytes. Ensure lib/lib/ exists
     // too: dependents' configurePhase reaches our rmeta via
@@ -586,10 +600,12 @@ source "$stdenv/setup"
                 "export NIXINC_REAL_RUSTC=$(command -v rustc)\n",
                 "export NIXINC_RMETA_DIR='{rmeta_dir}'\n",
                 "export NIXINC_EXPECTED_RMETA='{expected}'\n",
+                "export NIXINC_SKIP_LINK_PASS='{skip_link}'\n",
                 "export PATH='{wrap}':$PATH\n",
             ),
             rmeta_dir = tmp.join("rmeta").display(),
             expected = pl.expected_rmeta,
+            skip_link = if pl.skip_link_pass { "1" } else { "" },
             wrap = wrapper_dir.display(),
         ));
     }
@@ -656,7 +672,6 @@ exit $rc
         // for the rest of this run. is_cached_key only checks dest.exists(),
         // so a partial commit (ENOSPC, SIGKILL mid-copy) must not leave dest
         // behind or it poisons the cache.
-        let dest = cache.artifact_dir_by_key(&effective_key);
         if let Err(e) = hardlink_tree(&tmp, &dest) {
             let _ = std::fs::remove_dir_all(&dest);
             return Err(format!("committing {crate_name}: {e}"));
