@@ -530,7 +530,15 @@ pub fn build_crate_with_worker_signaled(
         inc_dir.display()
     ));
 
-    let work_dir = tmp.join("build");
+    // NIX_BUILD_TOP must be drv-path-stable, NOT effective-key-stable:
+    // buildRustCrate passes `--remap-path-prefix=$NIX_BUILD_TOP=/`, and rustc
+    // hashes remap-path-prefix into its [TRACKED] options. If the build dir
+    // moves whenever source changes (tmp/<effective_key>/build), the remap
+    // value moves with it and rustc invalidates the whole incremental session
+    // — paying dep-graph serialisation for nothing. Keying on drv_path (same
+    // key incremental_dir uses) keeps both stable across source edits.
+    let work_dir = cache.root().join("build").join(ArtifactCache::cache_key(drv_path));
+    let _ = std::fs::remove_dir_all(&work_dir);
     std::fs::create_dir_all(&work_dir)
         .map_err(|e| format!("creating work dir: {e}"))?;
     script.push_str(&format!("export NIX_BUILD_TOP='{}'\n", work_dir.display()));
@@ -685,9 +693,8 @@ exit $rc
         // -sys crates) would otherwise leak permanently. lib/out/rmeta/done
         // stay so embedded metadata paths and the wrapper's done-poll keep
         // resolving for the rest of this run.
-        for sub in ["build", "rustc-wrap"] {
-            let _ = std::fs::remove_dir_all(tmp.join(sub));
-        }
+        let _ = std::fs::remove_dir_all(&work_dir);
+        let _ = std::fs::remove_dir_all(tmp.join("rustc-wrap"));
         for f in ["builder.sh", "env.sh", "worker-stdout", "worker-stderr"] {
             let _ = std::fs::remove_file(tmp.join(f));
         }

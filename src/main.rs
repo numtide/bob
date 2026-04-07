@@ -440,7 +440,7 @@ fn cmd_clean(args: &[String]) {
 
     if args[0] == "--all" {
         let root = cache.root();
-        for subdir in &["artifacts", "incremental", "tmp", "rmeta"] {
+        for subdir in &["artifacts", "incremental", "tmp", "rmeta", "build"] {
             let path = root.join(subdir);
             if path.exists() {
                 let size = dir_size(&path);
