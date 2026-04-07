@@ -580,8 +580,34 @@ exit $rc
     if !success {
         let _ = std::fs::remove_dir_all(&tmp);
     } else {
-        cache.commit_key(&effective_key)
-            .map_err(|e| format!("committing {crate_name} to cache: {e}"))?;
+        // commit_key's rename(tmp→artifacts) leaves a window where tmp/<key>
+        // doesn't exist; once pipelining lets dependents start mid-build with
+        // tmp/<key> paths embedded in their crate metadata, a transitive lookup
+        // hitting that window E0463s. Hardlink-copy lib/out/rmeta into
+        // artifacts/<key> (same-fs, ~free) and keep those subdirs of tmp/<key>
+        // for the rest of this run. is_cached_key only checks dest.exists(),
+        // so a partial commit (ENOSPC, SIGKILL mid-copy) must not leave dest
+        // behind or it poisons the cache.
+        let dest = cache.artifact_dir_by_key(&effective_key);
+        if let Err(e) = hardlink_tree(&tmp, &dest) {
+            let _ = std::fs::remove_dir_all(&dest);
+            return Err(format!("committing {crate_name}: {e}"));
+        }
+        // Signal full completion for any wrapper polling on us (proc-macro/
+        // bin/cdylib consumers waiting for the rlib to be fully written).
+        let _ = std::fs::write(tmp.join("done"), b"");
+        // tmp/<key> is reset by the scheduler only when the SAME key rebuilds;
+        // workspace edits produce new keys and crates.io deps never rebuild,
+        // so build/ (NIX_BUILD_TOP — unpacked source, .o files, cmake trees for
+        // -sys crates) would otherwise leak permanently. lib/out/rmeta/done
+        // stay so embedded metadata paths and the wrapper's done-poll keep
+        // resolving for the rest of this run.
+        for sub in ["build", "rustc-wrap"] {
+            let _ = std::fs::remove_dir_all(tmp.join(sub));
+        }
+        for f in ["builder.sh", "env.sh", "worker-stdout", "worker-stderr"] {
+            let _ = std::fs::remove_file(tmp.join(f));
+        }
     }
 
     Ok(BuildResult {
@@ -593,6 +619,46 @@ exit $rc
         stderr: result.stderr,
         rmeta_dir: result.rmeta_dir,
     })
+}
+
+/// Recursive hardlink-copy (same-fs `cp -al`, without the fork). Only the
+/// `lib`, `out`, and `rmeta` subtrees are persisted; `build/` (NIX_BUILD_TOP,
+/// often hundreds of MB of unpacked source + .o files) is intentionally
+/// skipped — the bash `cp -al` was hardlinking it too, which is cheap on disk
+/// but still walks every file.
+fn hardlink_tree(src: &Path, dest: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dest)?;
+    for sub in ["lib", "out", "rmeta"] {
+        let s = src.join(sub);
+        if s.exists() {
+            hardlink_dir(&s, &dest.join(sub))?;
+        }
+    }
+    Ok(())
+}
+
+fn hardlink_dir(src: &Path, dest: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dest)?;
+    for e in std::fs::read_dir(src)? {
+        let e = e?;
+        let ft = e.file_type()?;
+        let to = dest.join(e.file_name());
+        if ft.is_dir() {
+            hardlink_dir(&e.path(), &to)?;
+        } else if ft.is_symlink() {
+            let target = std::fs::read_link(e.path())?;
+            let _ = std::os::unix::fs::symlink(target, &to);
+        } else {
+            // EEXIST is fine (idempotent re-commit); EXDEV would mean cross-fs
+            // which can't happen here (tmp/ and artifacts/ share cache root).
+            if let Err(err) = std::fs::hard_link(e.path(), &to) {
+                if err.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(err);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Rewrite output paths and dependency paths in the __structuredAttrs JSON
