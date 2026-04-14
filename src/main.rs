@@ -3,6 +3,7 @@ mod cache;
 mod drv;
 mod executor;
 mod graph;
+mod overrides;
 mod progress;
 mod resolve;
 mod rewrite;
@@ -297,34 +298,27 @@ fn cmd_build(args: &[String]) {
     }
 }
 
-/// Compute SourceOverrides for every workspace crate in the graph, with
-/// cascading invalidation through the dependency DAG.
-///
-/// The eval cache reuses a drv keyed only on `Cargo.lock`, so the drv's
-/// baked-in `src` store paths are stale once any workspace source changes.
-/// We fix this by:
-///
-///  1. Hashing each workspace crate's source dir (mtime fast-path, ~0.1ms each).
-///  2. Computing an *effective hash* per crate in topo order:
-///     `eff(c) = blake3( own_src_hash(c) ‖ sorted(eff(d) for d in crate_deps(c)) )`.
-///     Only crates that are workspace members, or depend (transitively) on one,
-///     get an entry. Crates.io deps are leaves w.r.t. workspace crates, so they
-///     stay on the plain `blake3(drv_path)` key and remain seedable from the
-///     nix store.
-///  3. Emitting a SourceOverride for every crate with an effective hash,
-///     pointing `src` at the live worktree dir. The scheduler then uses
-///     `cache_key_with_source(drv, eff)` for these crates: editing one
-///     workspace crate's source produces a new key for it *and* every
-///     downstream workspace crate, while everything else stays cached.
+/// Locate every workspace crate in the graph and hash its source dir, then
+/// cascade through the DAG. The Cargo-specific bits (workspace_members,
+/// crateName/version mapping) live here; the cascade is generic.
 fn compute_workspace_overrides(
     repo_root: &Path,
     g: &graph::BuildGraph,
 ) -> std::collections::HashMap<String, executor::SourceOverride> {
+    overrides::cascade(g, rust_own_hashes(repo_root, g))
+}
+
+/// Map drv_path → (own source hash, live src dir) for every workspace member
+/// present in the graph. crateName (== Cargo.toml `[package].name`) is matched
+/// against `[workspace].members`; the `version == "0.0.0"` heuristic is how
+/// cargo-nix-plugin tags local crates so we prefer those over a same-named
+/// crates.io dep.
+fn rust_own_hashes(
+    repo_root: &Path,
+    g: &graph::BuildGraph,
+) -> std::collections::HashMap<String, overrides::OwnHash> {
     use std::collections::HashMap;
 
-    // crateName (== Cargo.toml [package].name) → drv_path. If the same name
-    // appears in both the workspace and crates.io (it shouldn't), prefer the
-    // 0.0.0 version which is how cargo-nix-plugin tags local crates.
     let is_local = |drv: &str| {
         g.nodes[drv]
             .drv
@@ -358,66 +352,26 @@ fn compute_workspace_overrides(
         }
     }
 
-    // Per-workspace-crate own source hash + live src dir.
-    let mut own_hash: HashMap<String, String> = HashMap::new();
-    let mut src_dir: HashMap<String, PathBuf> = HashMap::new();
+    let mut own: HashMap<String, overrides::OwnHash> = HashMap::new();
     if let Ok(members) = resolve::EvalCache::workspace_members(repo_root) {
         for (name, rel) in &members {
             if let Some(drv) = name_to_drv.get(name) {
                 match resolve::EvalCache::source_hash(repo_root, rel) {
-                    Ok(h) => {
-                        own_hash.insert(drv.clone(), h);
-                        src_dir.insert(drv.clone(), repo_root.join(rel));
+                    Ok(hash) => {
+                        own.insert(
+                            drv.clone(),
+                            overrides::OwnHash {
+                                hash,
+                                src_dir: repo_root.join(rel),
+                            },
+                        );
                     }
                     Err(e) => eprintln!("  warn: hashing {}: {e}", rel.display()),
                 }
             }
         }
     }
-
-    // Effective hash in topo order (deps before dependents).
-    let mut eff: HashMap<String, String> = HashMap::new();
-    for drv in &g.topo_order {
-        let node = &g.nodes[drv];
-        let own = own_hash.get(drv);
-        let mut dep_effs: Vec<&str> = node
-            .crate_deps
-            .iter()
-            .filter_map(|d| eff.get(d).map(String::as_str))
-            .collect();
-        if own.is_none() && dep_effs.is_empty() {
-            // Pure crates.io subgraph — stable, plain key.
-            continue;
-        }
-        dep_effs.sort_unstable();
-        let mut h = blake3::Hasher::new();
-        if let Some(o) = own {
-            h.update(o.as_bytes());
-        }
-        for d in dep_effs {
-            h.update(b"\0");
-            h.update(d.as_bytes());
-        }
-        eff.insert(drv.clone(), h.finalize().to_hex()[..32].to_string());
-    }
-
-    let count = eff.len();
-    let overrides: HashMap<String, executor::SourceOverride> = eff
-        .into_iter()
-        .map(|(drv, hash)| {
-            let ov = executor::SourceOverride {
-                src_path: src_dir.get(&drv).cloned(),
-                source_hash: hash,
-            };
-            (drv, ov)
-        })
-        .collect();
-
-    eprintln!(
-        "  \x1b[2mTracking {} workspace crate(s) for source changes\x1b[0m",
-        count
-    );
-    overrides
+    own
 }
 
 fn cmd_clean(args: &[String]) {
