@@ -1,4 +1,5 @@
 mod attrs;
+mod backend;
 mod cache;
 mod drv;
 mod executor;
@@ -7,7 +8,7 @@ mod overrides;
 mod progress;
 mod resolve;
 mod rewrite;
-mod rustc_wrap;
+mod rust;
 mod scheduler;
 mod worker;
 
@@ -25,7 +26,7 @@ fn main() {
     match args[1].as_str() {
         // Internal: rmeta-pipelining rustc shim. Dispatched first because it's
         // the hot path — invoked once per rustc call inside builds.
-        "__rustc-wrap" => rustc_wrap::main(&args[2..]),
+        "__rustc-wrap" => rust::rustc_wrap::main(&args[2..]),
         "build" => cmd_build(&args[2..]),
         "clean" => cmd_clean(&args[2..]),
         "status" => cmd_status(),
@@ -84,55 +85,6 @@ fn find_repo_root() -> Result<PathBuf, String> {
     }
 }
 
-/// Detect workspace member name from cwd by reading Cargo.toml package name.
-fn detect_member_from_cwd() -> Result<String, String> {
-    let cwd = std::env::current_dir().map_err(|e| format!("getting cwd: {e}"))?;
-
-    // Walk up to find the nearest Cargo.toml with [package]
-    let mut dir = cwd.as_path();
-    loop {
-        let cargo_toml = dir.join("Cargo.toml");
-        if cargo_toml.exists() {
-            let contents = std::fs::read_to_string(&cargo_toml)
-                .map_err(|e| format!("reading {}: {e}", cargo_toml.display()))?;
-
-            // Look for `name = "..."` under [package]
-            let mut in_package = false;
-            for line in contents.lines() {
-                let trimmed = line.trim();
-                if trimmed == "[package]" {
-                    in_package = true;
-                    continue;
-                }
-                if trimmed.starts_with('[') {
-                    in_package = false;
-                    continue;
-                }
-                if in_package && trimmed.starts_with("name") {
-                    if let Some(name) = extract_toml_string_value(trimmed) {
-                        return Ok(name);
-                    }
-                }
-            }
-        }
-        match dir.parent() {
-            Some(p) => dir = p,
-            None => return Err("no Cargo.toml with [package] name found".into()),
-        }
-    }
-}
-
-/// Extract string value from a TOML line like `name = "foo"`.
-fn extract_toml_string_value(line: &str) -> Option<String> {
-    let (_, rhs) = line.split_once('=')?;
-    let rhs = rhs.trim();
-    if rhs.starts_with('"') && rhs.ends_with('"') && rhs.len() >= 2 {
-        Some(rhs[1..rhs.len() - 1].to_string())
-    } else {
-        None
-    }
-}
-
 /// Resolve a build target to a drv path.
 /// Accepts: "." (cwd detection), a member name, or a raw /nix/store/*.drv path.
 fn resolve_target(
@@ -147,7 +99,7 @@ fn resolve_target(
     }
 
     let member = if target == "." {
-        detect_member_from_cwd()?
+        rust::workspace::detect_from_cwd().ok_or("no Cargo.toml with [package] name found")?
     } else {
         target.to_string()
     };
@@ -299,79 +251,12 @@ fn cmd_build(args: &[String]) {
 }
 
 /// Locate every workspace crate in the graph and hash its source dir, then
-/// cascade through the DAG. The Cargo-specific bits (workspace_members,
-/// crateName/version mapping) live here; the cascade is generic.
+/// cascade through the DAG.
 fn compute_workspace_overrides(
     repo_root: &Path,
     g: &graph::BuildGraph,
 ) -> std::collections::HashMap<String, executor::SourceOverride> {
-    overrides::cascade(g, rust_own_hashes(repo_root, g))
-}
-
-/// Map drv_path → (own source hash, live src dir) for every workspace member
-/// present in the graph. crateName (== Cargo.toml `[package].name`) is matched
-/// against `[workspace].members`; the `version == "0.0.0"` heuristic is how
-/// cargo-nix-plugin tags local crates so we prefer those over a same-named
-/// crates.io dep.
-fn rust_own_hashes(
-    repo_root: &Path,
-    g: &graph::BuildGraph,
-) -> std::collections::HashMap<String, overrides::OwnHash> {
-    use std::collections::HashMap;
-
-    let is_local = |drv: &str| {
-        g.nodes[drv]
-            .drv
-            .env
-            .get("version")
-            .map(|v| v == "0.0.0")
-            .unwrap_or(false)
-    };
-    let mut name_to_drv: HashMap<String, String> = HashMap::new();
-    for (drv, node) in &g.nodes {
-        let Some(name) = node.drv.env.get("crateName") else {
-            continue;
-        };
-        let local = is_local(drv);
-        match name_to_drv.get(name) {
-            Some(_) if !local => {}
-            Some(prev) if is_local(prev) => {
-                // Resolver v1 unifies workspace features so this shouldn't
-                // happen today. If crate2nix ever emits two feature-variant
-                // drvs for one workspace member, the loser would silently
-                // miss its own_hash and serve stale source on edits.
-                eprintln!(
-                    "  warn: workspace crate '{name}' has multiple drvs ({prev} and {drv}); \
-                     source-change tracking will only cover one"
-                );
-                name_to_drv.insert(name.clone(), drv.clone());
-            }
-            _ => {
-                name_to_drv.insert(name.clone(), drv.clone());
-            }
-        }
-    }
-
-    let mut own: HashMap<String, overrides::OwnHash> = HashMap::new();
-    if let Ok(members) = resolve::EvalCache::workspace_members(repo_root) {
-        for (name, rel) in &members {
-            if let Some(drv) = name_to_drv.get(name) {
-                match resolve::EvalCache::source_hash(repo_root, rel) {
-                    Ok(hash) => {
-                        own.insert(
-                            drv.clone(),
-                            overrides::OwnHash {
-                                hash,
-                                src_dir: repo_root.join(rel),
-                            },
-                        );
-                    }
-                    Err(e) => eprintln!("  warn: hashing {}: {e}", rel.display()),
-                }
-            }
-        }
-    }
-    own
+    overrides::cascade(g, rust::workspace::unit_hashes(repo_root, g))
 }
 
 fn cmd_clean(args: &[String]) {

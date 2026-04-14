@@ -7,10 +7,11 @@
 //! This avoids the ~2s nix-instantiate on every edit while staying correct
 //! for transitive dependency changes.
 
-use std::collections::BTreeMap;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+
+use crate::rust::workspace::{lock_hash, workspace_members};
 
 /// Path to nix-instantiate. Must be a Nix that has
 /// `builtins.resolveCargoWorkspace` (cargo-nix-plugin) for the repo's
@@ -36,47 +37,6 @@ impl EvalCache {
         Self {
             cache_dir: cache_root.join("eval"),
         }
-    }
-
-    /// Build a map of package_name → relative_path from workspace Cargo.toml.
-    pub fn workspace_members(repo_root: &Path) -> Result<BTreeMap<String, PathBuf>, String> {
-        let cargo_toml = repo_root.join("Cargo.toml");
-        let contents = std::fs::read_to_string(&cargo_toml)
-            .map_err(|e| format!("reading {}: {e}", cargo_toml.display()))?;
-
-        let mut members = BTreeMap::new();
-        let mut in_members = false;
-
-        for line in contents.lines() {
-            let trimmed = line.trim();
-            if trimmed.starts_with("members") && trimmed.contains('[') {
-                in_members = true;
-                continue;
-            }
-            if in_members {
-                if trimmed.starts_with(']') {
-                    in_members = false;
-                    continue;
-                }
-                let item =
-                    trimmed.trim_matches(|c: char| c == '"' || c == ',' || c.is_whitespace());
-                if !item.is_empty() && !item.starts_with('#') {
-                    if let Some(name) = read_package_name(repo_root, item) {
-                        members.insert(name, PathBuf::from(item));
-                    }
-                }
-            }
-        }
-
-        Ok(members)
-    }
-
-    /// Hash Cargo.lock (captures dependency versions).
-    fn lock_hash(repo_root: &Path) -> Result<String, String> {
-        let lock_path = repo_root.join("Cargo.lock");
-        let contents = std::fs::read(&lock_path).map_err(|e| format!("reading Cargo.lock: {e}"))?;
-        let hash = blake3::hash(&contents);
-        Ok(hash.to_hex()[..16].to_string())
     }
 
     /// Hash a crate's source directory to detect file changes.
@@ -167,7 +127,7 @@ impl EvalCache {
     ///    build graph, so they don't invalidate this cache.
     /// 2. Miss → nix-instantiate (~2s)
     pub fn resolve_one(&self, repo_root: &Path, member: &str) -> Result<ResolveResult, String> {
-        let members = Self::workspace_members(repo_root)?;
+        let members = workspace_members(repo_root)?;
         if !members.contains_key(member) {
             let available: Vec<&str> = members.keys().map(|s| s.as_str()).take(10).collect();
             return Err(format!(
@@ -176,7 +136,7 @@ impl EvalCache {
             ));
         }
 
-        let lock_hash = Self::lock_hash(repo_root)?;
+        let lock_hash = lock_hash(repo_root)?;
 
         // Path 1: cached drv for this lock hash
         if let Some(drv_path) = self.load(member, &lock_hash) {
@@ -216,32 +176,6 @@ impl EvalCache {
 
         Ok(ResolveResult { drv_path })
     }
-}
-
-/// Read the `name` field from a crate's Cargo.toml [package] section.
-fn read_package_name(repo_root: &Path, rel_path: &str) -> Option<String> {
-    let cargo_toml = repo_root.join(rel_path).join("Cargo.toml");
-    let contents = std::fs::read_to_string(&cargo_toml).ok()?;
-
-    let mut in_package = false;
-    for line in contents.lines() {
-        let trimmed = line.trim();
-        if trimmed == "[package]" {
-            in_package = true;
-            continue;
-        }
-        if trimmed.starts_with('[') {
-            in_package = false;
-            continue;
-        }
-        if in_package && trimmed.starts_with("name") {
-            if let Some((_, rhs)) = trimmed.split_once('=') {
-                let rhs = rhs.trim().trim_matches('"');
-                return Some(rhs.to_string());
-            }
-        }
-    }
-    None
 }
 
 /// Recursively collect all files in a directory.
