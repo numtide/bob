@@ -35,7 +35,11 @@ impl BuildGraph {
     /// Build the graph, using a cached serialization when available.
     /// The cache key is blake3 of the sorted root drv paths — if the
     /// roots haven't changed (same nix eval), the graph is identical.
-    pub fn from_roots_cached(root_drv_paths: &[String], cache_dir: &Path) -> Result<Self, String> {
+    pub fn from_roots_cached(
+        root_drv_paths: &[String],
+        cache_dir: &Path,
+        is_unit: impl Fn(&Derivation) -> bool,
+    ) -> Result<Self, String> {
         let mut hasher = blake3::Hasher::new();
         let mut sorted = root_drv_paths.to_vec();
         sorted.sort();
@@ -50,7 +54,7 @@ impl BuildGraph {
             return Ok(g);
         }
 
-        let g = Self::from_roots(root_drv_paths)?;
+        let g = Self::from_roots(root_drv_paths, is_unit)?;
         g.save_cached(&cache_path);
         Ok(g)
     }
@@ -143,9 +147,11 @@ impl BuildGraph {
 
     /// Build the graph starting from a set of root drv paths.
     /// Walks `input_derivations` recursively, keeping only unit drvs
-    /// (currently: those with a `crateName` env var; becomes a backend
-    /// predicate in a follow-up commit).
-    pub fn from_roots(root_drv_paths: &[String]) -> Result<Self, String> {
+    /// per the supplied predicate; everything else becomes a boundary input.
+    pub fn from_roots(
+        root_drv_paths: &[String],
+        is_unit: impl Fn(&Derivation) -> bool,
+    ) -> Result<Self, String> {
         let mut nodes: BTreeMap<String, UnitNode> = BTreeMap::new();
         let mut queue: VecDeque<String> = root_drv_paths.iter().cloned().collect();
         let mut visited: HashSet<String> = HashSet::new();
@@ -166,8 +172,7 @@ impl BuildGraph {
             let drv =
                 Derivation::parse(&contents).map_err(|e| format!("parsing {drv_path}: {e}"))?;
 
-            // Only include unit derivations (backend predicate; for now: buildRustCrate)
-            if !drv.env.contains_key("crateName") {
+            if !is_unit(&drv) {
                 continue;
             }
 
@@ -476,7 +481,9 @@ mod tests {
             return;
         }
 
-        let graph = BuildGraph::from_roots(&[drv_path.to_string()]).unwrap();
+        let graph =
+            BuildGraph::from_roots(&[drv_path.to_string()], |d| d.env.contains_key("crateName"))
+                .unwrap();
         // Should have at least hello and serde
         assert!(
             graph.unit_count() >= 1,

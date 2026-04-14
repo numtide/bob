@@ -12,7 +12,10 @@ mod rust;
 mod scheduler;
 mod worker;
 
+use backend::Backend;
 use cache::ArtifactCache;
+
+static BACKEND: rust::RustBackend = rust::RustBackend;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -159,7 +162,8 @@ fn cmd_build(args: &[String]) {
     }
 
     let drv_paths: Vec<String> = resolve_results.iter().map(|r| r.drv_path.clone()).collect();
-    let g = graph::BuildGraph::from_roots_cached(&drv_paths, cache.root()).expect("building graph");
+    let g = graph::BuildGraph::from_roots_cached(&drv_paths, cache.root(), |d| BACKEND.is_unit(d))
+        .expect("building graph");
 
     // Realize any missing source tarballs / build inputs
     g.realize_inputs().expect("realizing inputs");
@@ -404,7 +408,7 @@ fn cmd_graph(args: &[String]) {
     }
 
     let roots: Vec<String> = args.to_vec();
-    match graph::BuildGraph::from_roots(&roots) {
+    match graph::BuildGraph::from_roots(&roots, |d| BACKEND.is_unit(d)) {
         Ok(g) => {
             println!("crates in graph: {}", g.unit_count());
             println!("topological order:");
