@@ -102,10 +102,9 @@ pub fn build_crate_with_worker_signaled(
     }
 
     // tmp/<key> is reset by the scheduler under lock (before publishing it via
-    // output_map) so dependents can't see stale bytes. Ensure lib/lib/ exists
-    // too: dependents' configurePhase reaches our rmeta via
-    // `$i/../rmeta/*.rmeta` where `$i = tmp/<key>/lib`, and bash glob can't
-    // resolve `lib/..` if `lib/` itself doesn't exist yet.
+    // output_map) so dependents can't see stale bytes. lib/lib/ is precreated
+    // so dependents' configure-phase symlink walk over `$dep/lib` doesn't race
+    // a missing dir before this crate's installPhase populates it.
     let tmp = cache.root().join("tmp").join(&effective_key);
     std::fs::create_dir_all(tmp.join("lib").join("lib"))
         .map_err(|e| format!("creating tmp dir: {e}"))?;
@@ -113,11 +112,9 @@ pub fn build_crate_with_worker_signaled(
 
     // Swap in-flight deps' .rlib paths for their early-written .rmeta. Applied
     // AFTER store-prefix rewrites so they match the already-rewritten cache/tmp
-    // paths. Also patch configurePhase's `symlink_dependency` glob so
-    // `-L dependency=target/deps` resolves transitive in-flight crates via
-    // their early rmeta. The rmeta lives at `<dep>/../rmeta/` (not `<dep>/lib/`)
-    // so installPhase's `cp target/lib/* $lib/lib` can't truncate it underneath
-    // a reader.
+    // paths. Transitive in-flight deps under `-L dependency=target/deps` are
+    // handled later by rustc_wrap::wait_closure_done_and_relink, which polls
+    // each dep's `done` marker and re-symlinks rlibs into target/deps.
     let apply_rmeta_rewrites = |s: &mut String| {
         for (from, to) in &pl.rmeta_rewrites {
             if s.contains(from) {
@@ -127,12 +124,6 @@ pub fn build_crate_with_worker_signaled(
     };
     for v in env.values_mut() {
         apply_rmeta_rewrites(v);
-    }
-    if let Some(cp) = env.get_mut("configurePhase") {
-        *cp = cp.replace(
-            "ln -s -f $i/lib/*.rlib $2",
-            "ln -s -f $i/lib/*.rlib $i/lib/*.rmeta $i/../rmeta/*.rmeta $2 2>/dev/null",
-        );
     }
 
     let out_dir = tmp.join("out");
