@@ -175,7 +175,7 @@ pub fn run_parallel(
         }
     };
     let artifact_dir = |drv: &str| cache.artifact_dir_by_key(&key_for(drv));
-    let is_cached = |drv: &str, node: &crate::graph::CrateNode| -> bool {
+    let is_cached = |drv: &str, node: &crate::graph::UnitNode| -> bool {
         if !cache.is_cached_key(&key_for(drv)) {
             return false;
         }
@@ -215,7 +215,7 @@ pub fn run_parallel(
         to_build += 1;
 
         let uncached_deps: Vec<&String> = node
-            .crate_deps
+            .unit_deps
             .iter()
             .filter(|dep| !is_cached(dep, &graph.nodes[dep.as_str()]))
             .collect();
@@ -302,7 +302,7 @@ pub fn run_parallel(
 #[allow(clippy::too_many_arguments)]
 fn worker_loop(
     state: &(Mutex<SharedState>, Condvar),
-    nodes: &BTreeMap<String, crate::graph::CrateNode>,
+    nodes: &BTreeMap<String, crate::graph::UnitNode>,
     cache: &ArtifactCache,
     worker: &mut crate::worker::Worker,
     progress: &Progress,
@@ -355,7 +355,7 @@ fn worker_loop(
             // symlinks each in-flight dep's early rmeta into target/deps and
             // re-resolves missing externs by metadata hash.
             let mut dep_map: BTreeMap<String, PathBuf> = BTreeMap::new();
-            for dep_drv in &node.crate_deps {
+            for dep_drv in &node.unit_deps {
                 let Some(dep_node) = nodes.get(dep_drv) else {
                     continue;
                 };
@@ -387,7 +387,7 @@ fn worker_loop(
             // output; for transitive deps the rlib is all anyone reads.
             skip_link_pass: !roots.contains(drv_path.as_str()),
         };
-        let result = executor::build_crate_with_worker_signaled(
+        let result = executor::build_unit(
             &drv_path,
             &node.drv,
             cache,

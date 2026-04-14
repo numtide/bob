@@ -70,7 +70,7 @@ pub struct BuildResult {
 /// Build a single crate derivation using a persistent worker, with mid-build
 /// `__META_READY__` signalling for rmeta pipelining.
 #[allow(clippy::too_many_arguments)]
-pub fn build_crate_with_worker_signaled(
+pub fn build_unit(
     drv_path: &str,
     drv: &Derivation,
     cache: &ArtifactCache,

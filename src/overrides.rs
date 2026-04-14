@@ -36,7 +36,7 @@ pub fn cascade(g: &BuildGraph, own: HashMap<String, OwnHash>) -> HashMap<String,
         let node = &g.nodes[drv];
         let mine = own.get(drv);
         let mut dep_effs: Vec<&str> = node
-            .crate_deps
+            .unit_deps
             .iter()
             .filter_map(|d| eff.get(d).map(String::as_str))
             .collect();

@@ -245,7 +245,7 @@ fn cmd_build(args: &[String]) {
 
     eprintln!(
         "\x1b[1m  Compiling\x1b[0m {} crates ({} jobs)",
-        g.crate_count(),
+        g.unit_count(),
         jobs
     );
 
@@ -521,7 +521,7 @@ fn cmd_graph(args: &[String]) {
     let roots: Vec<String> = args.to_vec();
     match graph::BuildGraph::from_roots(&roots) {
         Ok(g) => {
-            println!("crates in graph: {}", g.crate_count());
+            println!("crates in graph: {}", g.unit_count());
             println!("topological order:");
             for (i, drv_path) in g.topo_order.iter().enumerate() {
                 let node = &g.nodes[drv_path];
@@ -537,7 +537,7 @@ fn cmd_graph(args: &[String]) {
                     .get("crateVersion")
                     .unwrap_or(&String::new())
                     .clone();
-                let ndeps = node.crate_deps.len();
+                let ndeps = node.unit_deps.len();
                 println!("  {i:3}. {name}-{version} ({ndeps} deps)");
             }
         }

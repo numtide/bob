@@ -1,5 +1,9 @@
-//! Build graph: walk .drv input_derivations to discover the full crate DAG,
-//! topologically sort, and identify which crates need (re)building.
+//! Build graph: walk .drv input_derivations to discover the unit DAG,
+//! topologically sort, and identify which units need (re)building.
+//!
+//! A "unit" is a drv that bob replays itself (per-crate Rust drv, per-package
+//! Go drv, …). Everything else is a "boundary input" — toolchain, C libs,
+//! fetchers — realised once via `nix-store --realise` and read from the store.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;
@@ -9,22 +13,22 @@ use crate::drv::Derivation;
 
 /// A node in the build graph.
 #[derive(Debug)]
-pub struct CrateNode {
+pub struct UnitNode {
     pub drv_path: String,
     pub drv: Derivation,
-    /// Direct dependency drv paths (only crate deps, not toolchain).
-    pub crate_deps: Vec<String>,
+    /// Direct dependency drv paths (unit→unit edges only, not boundary inputs).
+    pub unit_deps: Vec<String>,
 }
 
-/// The full build graph of crate derivations.
+/// The full build graph of unit derivations.
 #[derive(Debug)]
 pub struct BuildGraph {
-    pub nodes: BTreeMap<String, CrateNode>,
+    pub nodes: BTreeMap<String, UnitNode>,
     /// Topologically sorted drv paths (dependencies before dependents).
     pub topo_order: Vec<String>,
-    /// Non-crate input drv paths and their output paths, precomputed
-    /// to avoid re-parsing drvs on every run.
-    pub non_crate_input_map: BTreeMap<String, Vec<String>>,
+    /// Boundary-input drv paths → their output store paths, precomputed so we
+    /// can `nix-store --realise` the missing ones without re-parsing drvs.
+    pub boundary_inputs: BTreeMap<String, Vec<String>>,
 }
 
 impl BuildGraph {
@@ -59,8 +63,8 @@ impl BuildGraph {
         for (drv_path, node) in &self.nodes {
             write_str(&mut buf, drv_path);
             write_derivation(&mut buf, &node.drv);
-            buf.extend_from_slice(&(node.crate_deps.len() as u32).to_le_bytes());
-            for dep in &node.crate_deps {
+            buf.extend_from_slice(&(node.unit_deps.len() as u32).to_le_bytes());
+            for dep in &node.unit_deps {
                 write_str(&mut buf, dep);
             }
         }
@@ -68,9 +72,9 @@ impl BuildGraph {
         for p in &self.topo_order {
             write_str(&mut buf, p);
         }
-        // non_crate_input_map
-        buf.extend_from_slice(&(self.non_crate_input_map.len() as u32).to_le_bytes());
-        for (drv, outs) in &self.non_crate_input_map {
+        // boundary_inputs
+        buf.extend_from_slice(&(self.boundary_inputs.len() as u32).to_le_bytes());
+        for (drv, outs) in &self.boundary_inputs {
             write_str(&mut buf, drv);
             buf.extend_from_slice(&(outs.len() as u32).to_le_bytes());
             for o in outs {
@@ -96,16 +100,16 @@ impl BuildGraph {
             }
             let drv = read_derivation(&buf, &mut pos)?;
             let num_deps = read_u32(&buf, &mut pos)?;
-            let mut crate_deps = Vec::with_capacity(num_deps as usize);
+            let mut unit_deps = Vec::with_capacity(num_deps as usize);
             for _ in 0..num_deps {
-                crate_deps.push(read_string(&buf, &mut pos)?);
+                unit_deps.push(read_string(&buf, &mut pos)?);
             }
             nodes.insert(
                 drv_path.clone(),
-                CrateNode {
+                UnitNode {
                     drv_path,
                     drv,
-                    crate_deps,
+                    unit_deps,
                 },
             );
         }
@@ -116,8 +120,8 @@ impl BuildGraph {
             topo_order.push(read_string(&buf, &mut pos)?);
         }
 
-        // non_crate_input_map
-        let mut non_crate_input_map = BTreeMap::new();
+        // boundary_inputs
+        let mut boundary_inputs = BTreeMap::new();
         if let Some(num_nci) = read_u32(&buf, &mut pos) {
             for _ in 0..num_nci {
                 let drv = read_string(&buf, &mut pos)?;
@@ -126,22 +130,23 @@ impl BuildGraph {
                 for _ in 0..num_outs {
                     outs.push(read_string(&buf, &mut pos)?);
                 }
-                non_crate_input_map.insert(drv, outs);
+                boundary_inputs.insert(drv, outs);
             }
         }
 
         Some(BuildGraph {
             nodes,
             topo_order,
-            non_crate_input_map,
+            boundary_inputs,
         })
     }
 
     /// Build the graph starting from a set of root drv paths.
-    /// Walks input_derivations recursively, keeping only crate drvs
-    /// (identified by having a `crateName` env var).
+    /// Walks `input_derivations` recursively, keeping only unit drvs
+    /// (currently: those with a `crateName` env var; becomes a backend
+    /// predicate in a follow-up commit).
     pub fn from_roots(root_drv_paths: &[String]) -> Result<Self, String> {
-        let mut nodes: BTreeMap<String, CrateNode> = BTreeMap::new();
+        let mut nodes: BTreeMap<String, UnitNode> = BTreeMap::new();
         let mut queue: VecDeque<String> = root_drv_paths.iter().cloned().collect();
         let mut visited: HashSet<String> = HashSet::new();
 
@@ -161,13 +166,13 @@ impl BuildGraph {
             let drv =
                 Derivation::parse(&contents).map_err(|e| format!("parsing {drv_path}: {e}"))?;
 
-            // Only include crate derivations (those built by buildRustCrate)
+            // Only include unit derivations (backend predicate; for now: buildRustCrate)
             if !drv.env.contains_key("crateName") {
                 continue;
             }
 
-            // Find crate dependencies: input drvs that are also crate drvs.
-            // We enqueue all input drvs for exploration but only link crate→crate edges.
+            // Find unit dependencies: input drvs that are also unit drvs.
+            // We enqueue all input drvs for exploration but only link unit→unit edges.
             let input_drv_paths: Vec<String> = drv.input_derivations.keys().cloned().collect();
             for dep_path in &input_drv_paths {
                 queue.push_back(dep_path.clone());
@@ -175,36 +180,36 @@ impl BuildGraph {
 
             nodes.insert(
                 drv_path.clone(),
-                CrateNode {
+                UnitNode {
                     drv_path: drv_path.clone(),
                     drv,
-                    crate_deps: Vec::new(), // filled in second pass
+                    unit_deps: Vec::new(), // filled in second pass
                 },
             );
         }
 
-        // Second pass: fill in crate_deps (only edges to other crate nodes)
-        let crate_drv_paths: HashSet<String> = nodes.keys().cloned().collect();
+        // Second pass: fill in unit_deps (only edges to other unit nodes)
+        let unit_drv_paths: HashSet<String> = nodes.keys().cloned().collect();
         for node in nodes.values_mut() {
-            node.crate_deps = node
+            node.unit_deps = node
                 .drv
                 .input_derivations
                 .keys()
-                .filter(|p| crate_drv_paths.contains(p.as_str()))
+                .filter(|p| unit_drv_paths.contains(p.as_str()))
                 .cloned()
                 .collect();
         }
 
         let topo_order = topo_sort(&nodes)?;
 
-        // Precompute non-crate input drv → output paths mapping
-        let mut non_crate_input_map: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        // Precompute boundary-input drv → output paths mapping
+        let mut boundary_inputs: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for node in nodes.values() {
             for (dep_drv, dep_outputs) in &node.drv.input_derivations {
-                if crate_drv_paths.contains(dep_drv.as_str()) {
+                if unit_drv_paths.contains(dep_drv.as_str()) {
                     continue;
                 }
-                if non_crate_input_map.contains_key(dep_drv) {
+                if boundary_inputs.contains_key(dep_drv) {
                     continue;
                 }
                 let dep_drv_path = Path::new(dep_drv);
@@ -219,7 +224,7 @@ impl BuildGraph {
                                 out_paths.push(out.path.clone());
                             }
                         }
-                        non_crate_input_map.insert(dep_drv.clone(), out_paths);
+                        boundary_inputs.insert(dep_drv.clone(), out_paths);
                     }
                 }
             }
@@ -228,32 +233,32 @@ impl BuildGraph {
         Ok(BuildGraph {
             nodes,
             topo_order,
-            non_crate_input_map,
+            boundary_inputs,
         })
     }
 
-    pub fn crate_count(&self) -> usize {
+    pub fn unit_count(&self) -> usize {
         self.nodes.len()
     }
 
-    /// Collect non-crate input drv paths that have unrealized outputs.
+    /// Collect boundary-input drv paths that have unrealised outputs.
     /// Uses the precomputed map to avoid re-parsing drv files.
-    pub fn non_crate_inputs(&self) -> Vec<String> {
-        self.non_crate_input_map
+    pub fn unrealised_boundary_inputs(&self) -> Vec<String> {
+        self.boundary_inputs
             .iter()
             .filter(|(_, out_paths)| out_paths.iter().any(|p| !Path::new(p).exists()))
             .map(|(drv, _)| drv.clone())
             .collect()
     }
 
-    /// Realize any missing non-crate store paths (source tarballs, etc).
+    /// Realise any missing boundary store paths (source tarballs, toolchain, etc).
     /// Shells out to nix-store --realise.
     ///
     /// TODO: talk to the Nix daemon directly over its Unix socket protocol
     /// instead of shelling out — saves ~5ms process overhead and lets us
     /// overlap fetching with cache checks / early builds.
     pub fn realize_inputs(&self) -> Result<(), String> {
-        let missing = self.non_crate_inputs();
+        let missing = self.unrealised_boundary_inputs();
         if missing.is_empty() {
             return Ok(());
         }
@@ -404,17 +409,17 @@ fn read_string(buf: &[u8], pos: &mut usize) -> Option<String> {
 }
 
 /// Kahn's algorithm for topological sort.
-fn topo_sort(nodes: &BTreeMap<String, CrateNode>) -> Result<Vec<String>, String> {
+fn topo_sort(nodes: &BTreeMap<String, UnitNode>) -> Result<Vec<String>, String> {
     let mut in_deg: HashMap<&str, usize> = nodes.keys().map(|k| (k.as_str(), 0usize)).collect();
     for node in nodes.values() {
-        for dep in &node.crate_deps {
+        for dep in &node.unit_deps {
             if nodes.contains_key(dep) {
                 *in_deg.entry(node.drv_path.as_str()).or_default() += 1;
             }
         }
     }
 
-    // Kahn's: start with nodes that have no crate deps
+    // Kahn's: start with nodes that have no unit deps
     let mut queue: VecDeque<&str> = in_deg
         .iter()
         .filter(|(_, &deg)| deg == 0)
@@ -425,7 +430,7 @@ fn topo_sort(nodes: &BTreeMap<String, CrateNode>) -> Result<Vec<String>, String>
     // Build reverse adjacency: dep → dependents
     let mut dependents: HashMap<&str, Vec<&str>> = HashMap::new();
     for node in nodes.values() {
-        for dep in &node.crate_deps {
+        for dep in &node.unit_deps {
             if nodes.contains_key(dep) {
                 dependents
                     .entry(dep.as_str())
@@ -474,9 +479,9 @@ mod tests {
         let graph = BuildGraph::from_roots(&[drv_path.to_string()]).unwrap();
         // Should have at least hello and serde
         assert!(
-            graph.crate_count() >= 1,
+            graph.unit_count() >= 1,
             "expected at least 1 crate, got {}",
-            graph.crate_count()
+            graph.unit_count()
         );
 
         // Topo order should have deps before dependents
@@ -489,7 +494,7 @@ mod tests {
 
         for node in graph.nodes.values() {
             let my_pos = positions[node.drv_path.as_str()];
-            for dep in &node.crate_deps {
+            for dep in &node.unit_deps {
                 if let Some(&dep_pos) = positions.get(dep.as_str()) {
                     assert!(
                         dep_pos < my_pos,
