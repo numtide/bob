@@ -1,0 +1,15 @@
+[package]
+name = "bob"
+description = "Bob the Builder — fast incremental builds on top of Nix"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "bob"
+path = "src/main.rs"
+
+[dependencies]
+bob-core.workspace = true
+bob-rust.workspace = true

@@ -1,24 +1,9 @@
-mod attrs;
-mod backend;
-mod cache;
-mod drv;
-mod executor;
-mod graph;
-mod overrides;
-mod progress;
-mod resolve;
-mod rewrite;
-mod rust;
-mod scheduler;
-mod worker;
-
 use std::path::Path;
 use std::path::PathBuf;
 
-use backend::Backend;
-use cache::ArtifactCache;
+use bob_core::{drv, graph, overrides, resolve, scheduler, ArtifactCache, Backend};
 
-static BACKEND: rust::RustBackend = rust::RustBackend;
+static BACKEND: bob_rust::RustBackend = bob_rust::RustBackend;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

@@ -4,15 +4,12 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::backend::{Backend, BuildContext, PipelinePolicy};
-use crate::drv::Derivation;
-use crate::graph::BuildGraph;
-use crate::overrides::OwnHash;
+use bob_core::{Backend, BuildContext, BuildGraph, Derivation, OwnHash, PipelinePolicy};
 
-pub mod hooks;
-pub mod pipeline;
-pub mod rustc_wrap;
-pub mod workspace;
+mod hooks;
+mod pipeline;
+mod rustc_wrap;
+mod workspace;
 
 pub struct RustBackend;
 

@@ -16,6 +16,12 @@ pub struct ArtifactCache {
     root: PathBuf,
 }
 
+impl Default for ArtifactCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ArtifactCache {
     pub fn new() -> Self {
         let cache_dir = std::env::var("XDG_CACHE_HOME").unwrap_or_else(|_| {

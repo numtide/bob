@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 
 /// A map of original store paths → replacement paths.
 /// Applied to all env vars before executing the build.
+#[derive(Default)]
 pub struct PathRewriter {
     rewrites: Vec<(String, String)>,
 }

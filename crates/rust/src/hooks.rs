@@ -4,8 +4,7 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-use crate::backend::BuildContext;
-use crate::drv::Derivation;
+use bob_core::{BuildContext, Derivation};
 
 use super::pipeline::lib_filename;
 

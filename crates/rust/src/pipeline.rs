@@ -3,8 +3,7 @@
 
 use std::path::Path;
 
-use crate::backend::PipelinePolicy;
-use crate::drv::Derivation;
+use bob_core::{Derivation, PipelinePolicy};
 
 pub struct RustPipeline;
 

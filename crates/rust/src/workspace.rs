@@ -5,9 +5,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
-use crate::graph::BuildGraph;
-use crate::overrides::OwnHash;
-use crate::resolve::EvalCache;
+use bob_core::resolve::EvalCache;
+use bob_core::{BuildGraph, OwnHash};
 
 /// blake3 of `Cargo.lock` — gates the eval-cache (drv reuse is sound as long
 /// as the dependency graph is unchanged).

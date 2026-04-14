@@ -32,9 +32,25 @@ dependencies = [
 name = "bob"
 version = "0.1.0"
 dependencies = [
+ "bob-core",
+ "bob-rust",
+]
+
+[[package]]
+name = "bob-core"
+version = "0.1.0"
+dependencies = [
  "blake3",
  "libc",
  "serde_json",
+]
+
+[[package]]
+name = "bob-rust"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "bob-core",
 ]
 
 [[package]]
