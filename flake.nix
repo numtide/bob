@@ -3,10 +3,19 @@
 
   inputs = {
     nixpkgs.url = "https://channels.nixos.org/nixpkgs-unstable/nixexprs.tar.xz";
+
+    devshell = {
+      url = "github:numtide/devshell";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
-    { self, nixpkgs }:
+    {
+      self,
+      nixpkgs,
+      devshell,
+    }:
     let
       systems = [
         "x86_64-linux"
@@ -14,27 +23,20 @@
         "x86_64-darwin"
         "aarch64-darwin"
       ];
-      forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
+      forAllSystems =
+        f:
+        nixpkgs.lib.genAttrs systems (
+          system: f (nixpkgs.legacyPackages.${system}.extend devshell.overlays.default)
+        );
     in
     {
       packages = forAllSystems (pkgs: {
-        bob = pkgs.rustPlatform.buildRustPackage {
-          pname = "bob";
-          version = (nixpkgs.lib.importTOML ./Cargo.toml).package.version;
-          src = ./.;
-          cargoLock.lockFile = ./Cargo.lock;
-          meta = {
-            description = "Fast incremental builds on top of Nix";
-            homepage = "https://github.com/numtide/bob";
-            license = nixpkgs.lib.licenses.mit;
-            mainProgram = "bob";
-          };
-        };
-        default = self.packages.${pkgs.stdenv.hostPlatform.system}.bob;
+        inherit (import ./default.nix { inherit pkgs; }) bob default;
       });
 
       devShells = forAllSystems (pkgs: {
-        default = pkgs.mkShell {
+        default = pkgs.devshell.mkShell {
+          name = "bob";
           packages = with pkgs; [
             cargo
             rustc
@@ -42,12 +44,32 @@
             clippy
             rust-analyzer
           ];
-          RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
+          env = [
+            {
+              name = "RUST_SRC_PATH";
+              value = "${pkgs.rustPlatform.rustLibSrc}";
+            }
+          ];
+          commands = [
+            {
+              name = "fmt";
+              help = "format nix + rust";
+              command = ''
+                ${pkgs.lib.getExe pkgs.nixfmt-tree} "$PRJ_ROOT"
+                cargo fmt --manifest-path "$PRJ_ROOT/Cargo.toml"
+              '';
+            }
+            {
+              name = "lint";
+              help = "cargo clippy";
+              command = ''cargo clippy --manifest-path "$PRJ_ROOT/Cargo.toml" -- -D warnings'';
+            }
+          ];
         };
       });
 
       checks = forAllSystems (pkgs: {
-        bob = self.packages.${pkgs.stdenv.hostPlatform.system}.bob;
+        inherit (self.packages.${pkgs.stdenv.hostPlatform.system}) bob;
         fmt =
           pkgs.runCommand "cargo-fmt-check"
             {
@@ -63,6 +85,6 @@
             '';
       });
 
-      formatter = forAllSystems (pkgs: pkgs.nixfmt);
+      formatter = forAllSystems (pkgs: pkgs.nixfmt-tree);
     };
 }
