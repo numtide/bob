@@ -36,7 +36,9 @@
 
       devShells = forAllSystems (pkgs: {
         default = pkgs.devshell.mkShell {
-          name = "bob";
+          # devshell installs bin/<name> -> entrypoint, which would shadow
+          # the actual `bob` binary on PATH. Use a distinct name.
+          name = "bob-dev";
           packages = with pkgs; [
             cargo
             rustc
