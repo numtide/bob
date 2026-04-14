@@ -1,3 +1,4 @@
+mod attrs;
 mod cache;
 mod drv;
 mod executor;
