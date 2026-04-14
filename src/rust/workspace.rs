@@ -128,7 +128,7 @@ pub fn unit_hashes(repo_root: &Path, g: &BuildGraph) -> HashMap<String, OwnHash>
     if let Ok(members) = workspace_members(repo_root) {
         for (name, rel) in &members {
             if let Some(drv) = name_to_drv.get(name) {
-                match EvalCache::source_hash(repo_root, rel) {
+                match EvalCache::source_hash(repo_root, rel, &|n| n == "target") {
                     Ok(hash) => {
                         own.insert(
                             drv.clone(),

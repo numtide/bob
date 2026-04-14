@@ -101,14 +101,21 @@ fn resolve_target(
         });
     }
 
-    let member = if target == "." {
-        rust::workspace::detect_from_cwd().ok_or("no Cargo.toml with [package] name found")?
+    let name = if target == "." {
+        BACKEND
+            .detect_from_cwd()
+            .ok_or("could not detect target from current directory")?
     } else {
         target.to_string()
     };
 
+    let attr = BACKEND
+        .resolve_attr(&name, repo_root)
+        .ok_or_else(|| format!("unknown target '{name}'"))?;
+    let lock_hash = BACKEND.lock_hash(repo_root)?;
+
     let eval_cache = resolve::EvalCache::new(cache.root());
-    eval_cache.resolve_one(repo_root, &member)
+    eval_cache.resolve_one(repo_root, &name, &attr, &lock_hash)
 }
 
 fn cmd_build(args: &[String]) {
@@ -286,9 +293,8 @@ fn cmd_clean(args: &[String]) {
     // Clean a specific member — need to find its drv path
     let member = &args[0];
     let repo_root = find_repo_root().expect("could not find repo root");
-    let eval_cache = resolve::EvalCache::new(cache.root());
 
-    match eval_cache.resolve_one(&repo_root, member) {
+    match resolve_target(member, &repo_root, &cache) {
         Ok(r) => {
             let artifact = cache.artifact_dir(&r.drv_path);
             let inc = cache.incremental_dir(&r.drv_path);

@@ -1,22 +1,21 @@
-//! Resolve workspace member names to drv paths via nix-instantiate.
+//! Resolve target names to drv paths via nix-instantiate against `bob.nix`.
 //!
-//! The eval cache is keyed on `(member, Cargo.lock hash)` only. Source
-//! changes do NOT invalidate it: we always reuse the cached drv and let
-//! `compute_workspace_overrides()` (in main.rs) detect per-crate source
-//! changes and cascade them through the build graph as cache-key overrides.
-//! This avoids the ~2s nix-instantiate on every edit while staying correct
-//! for transitive dependency changes.
+//! The eval cache is keyed on `(target, lock_hash)` only — the backend
+//! supplies `lock_hash` (e.g. blake3 of Cargo.lock / go.sum). Source changes
+//! do NOT invalidate it: we always reuse the cached drv and let
+//! `overrides::cascade` detect per-unit source changes and cascade them
+//! through the build graph as cache-key overrides. This avoids the ~2s
+//! nix-instantiate on every edit while staying correct for transitive
+//! dependency changes.
 
+use std::ffi::OsStr;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
-use crate::rust::workspace::{lock_hash, workspace_members};
-
-/// Path to nix-instantiate. Must be a Nix that has
-/// `builtins.resolveCargoWorkspace` (cargo-nix-plugin) for the repo's
-/// `bob.nix` to evaluate. Override with `BOB_NIX_INSTANTIATE` to point at a
-/// patched build; otherwise resolved from PATH.
+/// Path to nix-instantiate. The repo's `bob.nix` may need extra builtins
+/// (e.g. `resolveCargoWorkspace`); point `BOB_NIX_INSTANTIATE` at a patched
+/// build, otherwise resolved from PATH.
 fn nix_instantiate() -> String {
     std::env::var("BOB_NIX_INSTANTIATE").unwrap_or_else(|_| "nix-instantiate".into())
 }
@@ -39,18 +38,25 @@ impl EvalCache {
         }
     }
 
-    /// Hash a crate's source directory to detect file changes.
+    /// Hash a unit's source directory to detect file changes.
     /// Uses a two-level approach: first hashes mtimes (fast ~0.1ms),
     /// then only reads file contents if the mtime hash changed since
     /// last time. The mtime→content mapping is cached under
     /// `$XDG_CACHE_HOME/bob/mtime/<blake3(abs_dir)>` so we don't litter
-    /// the worktree (this now runs on every workspace crate, not just the
+    /// the worktree (this runs on every workspace unit, not just the
     /// build target).
-    pub fn source_hash(repo_root: &Path, crate_dir: &Path) -> Result<String, String> {
-        let abs_dir = repo_root.join(crate_dir);
+    ///
+    /// `skip_dir` filters out per-language build dirs (e.g. `target/`).
+    /// Dot-dirs are always skipped.
+    pub fn source_hash(
+        repo_root: &Path,
+        unit_dir: &Path,
+        skip_dir: &dyn Fn(&OsStr) -> bool,
+    ) -> Result<String, String> {
+        let abs_dir = repo_root.join(unit_dir);
         let dir_key = blake3::hash(abs_dir.to_string_lossy().as_bytes()).to_hex()[..32].to_string();
         let mut files: Vec<PathBuf> = Vec::new();
-        collect_files(&abs_dir, &mut files);
+        collect_files(&abs_dir, skip_dir, &mut files);
         files.sort();
 
         // Fast path: hash file paths + mtimes + sizes
@@ -101,58 +107,39 @@ impl EvalCache {
         Ok(content_hash)
     }
 
-    /// Load a cached drv path for a given (member, lock_hash).
-    fn load(&self, member: &str, lock_hash: &str) -> Option<String> {
-        let path = self.cache_dir.join(format!("{member}.{lock_hash}.drv"));
-        std::fs::read_to_string(&path).ok()
+    fn cache_path(&self, target: &str, lock_hash: &str) -> PathBuf {
+        // Hash the attr/target so dotted attr paths don't produce nested dirs.
+        let key = blake3::hash(target.as_bytes()).to_hex()[..16].to_string();
+        self.cache_dir.join(format!("{key}.{lock_hash}.drv"))
     }
 
-    /// Save a resolved drv path.
-    fn save(&self, member: &str, lock_hash: &str, drv_path: &str) -> Result<(), String> {
-        std::fs::create_dir_all(&self.cache_dir)
-            .map_err(|e| format!("creating eval cache dir: {e}"))?;
-        std::fs::write(
-            self.cache_dir.join(format!("{member}.{lock_hash}.drv")),
-            drv_path,
-        )
-        .map_err(|e| format!("writing eval cache: {e}"))?;
-        Ok(())
-    }
-
-    /// Resolve a single workspace member name to its drv path.
+    /// Resolve a backend-supplied attr path under `(import bob.nix {})` to a
+    /// drv path.
     ///
-    /// Two paths:
-    /// 1. Cache hit (same Cargo.lock) → return cached drv (~1ms). Source
-    ///    changes are handled later via per-crate overrides against the
-    ///    build graph, so they don't invalidate this cache.
-    /// 2. Miss → nix-instantiate (~2s)
-    pub fn resolve_one(&self, repo_root: &Path, member: &str) -> Result<ResolveResult, String> {
-        let members = workspace_members(repo_root)?;
-        if !members.contains_key(member) {
-            let available: Vec<&str> = members.keys().map(|s| s.as_str()).take(10).collect();
-            return Err(format!(
-                "unknown workspace member '{member}'. some available: {}",
-                available.join(", ")
-            ));
-        }
+    /// 1. Cache hit (same `lock_hash`) → return cached drv (~1ms). Source
+    ///    changes are handled later via per-unit overrides against the build
+    ///    graph, so they don't invalidate this cache.
+    /// 2. Miss → nix-instantiate (~2s).
+    pub fn resolve_one(
+        &self,
+        repo_root: &Path,
+        target: &str,
+        attr: &str,
+        lock_hash: &str,
+    ) -> Result<ResolveResult, String> {
+        let cache_path = self.cache_path(target, lock_hash);
 
-        let lock_hash = lock_hash(repo_root)?;
-
-        // Path 1: cached drv for this lock hash
-        if let Some(drv_path) = self.load(member, &lock_hash) {
+        if let Ok(drv_path) = std::fs::read_to_string(&cache_path) {
             if Path::new(&drv_path).exists() {
-                eprintln!(" \x1b[1;32mResolved\x1b[0m {member} \x1b[2m(cached)\x1b[0m");
+                eprintln!(" \x1b[1;32mResolved\x1b[0m {target} \x1b[2m(cached)\x1b[0m");
                 return Ok(ResolveResult { drv_path });
             }
         }
 
-        // Path 2: full nix-instantiate against the repo's bob.nix.
-        // bob.nix must evaluate to an attrset with
-        // `workspaceMembers.<name>.build` (the cargo-nix-plugin convention).
-        eprintln!(" \x1b[1;36mResolving\x1b[0m '{member}' via nix-instantiate...");
+        eprintln!(" \x1b[1;36mResolving\x1b[0m '{target}' via nix-instantiate...");
 
         let expr = format!(
-            "(import {root}/bob.nix {{}}).workspaceMembers.{member}.build",
+            "(import {root}/bob.nix {{}}).{attr}",
             root = repo_root.display(),
         );
 
@@ -164,7 +151,7 @@ impl EvalCache {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("nix-instantiate failed for '{member}': {stderr}"));
+            return Err(format!("nix-instantiate failed for '{attr}': {stderr}"));
         }
 
         let drv_path = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -172,14 +159,16 @@ impl EvalCache {
             return Err(format!("unexpected nix-instantiate output: {drv_path}"));
         }
 
-        self.save(member, &lock_hash, &drv_path)?;
+        let _ = std::fs::create_dir_all(&self.cache_dir);
+        std::fs::write(&cache_path, &drv_path).map_err(|e| format!("writing eval cache: {e}"))?;
 
         Ok(ResolveResult { drv_path })
     }
 }
 
-/// Recursively collect all files in a directory.
-fn collect_files(dir: &Path, files: &mut Vec<PathBuf>) {
+/// Recursively collect all files in a directory, skipping dot-dirs and
+/// anything `skip_dir` rejects.
+fn collect_files(dir: &Path, skip_dir: &dyn Fn(&OsStr) -> bool, files: &mut Vec<PathBuf>) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return,
@@ -188,11 +177,10 @@ fn collect_files(dir: &Path, files: &mut Vec<PathBuf>) {
         let path = entry.path();
         if path.is_dir() {
             let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name == "target" || name.starts_with('.') {
+            if name.to_string_lossy().starts_with('.') || skip_dir(&name) {
                 continue;
             }
-            collect_files(&path, files);
+            collect_files(&path, skip_dir, files);
         } else {
             files.push(path);
         }
