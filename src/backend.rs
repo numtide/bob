@@ -1,8 +1,5 @@
 //! Language-backend abstraction.
 //!
-// Wired up in the follow-up "route everything through BACKEND" commit.
-#![allow(dead_code)]
-//!
 //! bob's core (drv parser, graph, cache, path rewriter, worker pool,
 //! scheduler, `.attrs.{json,sh}` emission, `genericBuild` replay) is
 //! language-agnostic. A `Backend` supplies the per-language policy:
@@ -49,6 +46,9 @@ pub struct BuildContext<'a> {
 }
 
 pub trait Backend: Send + Sync {
+    /// Backend identifier. Used to tag `UnitNode`s once multiple backends can
+    /// coexist in one graph; with a single backend nothing reads it yet.
+    #[allow(dead_code)]
     fn id(&self) -> &'static str;
 
     // ── graph ──────────────────────────────────────────────────────────────

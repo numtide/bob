@@ -10,7 +10,7 @@
 //!     configurePhase, or any backend without an early-artifact analogue).
 //!
 //! Worker threads pull from `ready`, build, and on completion decrement
-//! dependents' `pending_done`. The fd-3 callback decrements `pending_rmeta`.
+//! dependents' `pending_done`. The fd-3 callback decrements `pending_early`.
 //! A unit becomes ready when both counters hit zero.
 
 use std::collections::BTreeMap;
@@ -35,11 +35,11 @@ pub struct SchedulerResult {
 struct SharedState {
     ready: Vec<String>,
     /// Count of deps whose rmeta we're waiting on (pipelineable deps).
-    pending_rmeta: HashMap<String, usize>,
+    pending_early: HashMap<String, usize>,
     /// Count of deps whose full build we're waiting on (proc-macro/build.rs).
     pending_done: HashMap<String, usize>,
     /// dep → dependents waiting on its rmeta.
-    rmeta_dependents: HashMap<String, Vec<String>>,
+    early_dependents: HashMap<String, Vec<String>>,
     /// dep → dependents waiting on its full completion.
     done_dependents: HashMap<String, Vec<String>>,
     /// store-output-path → cache/tmp path. Populated for cached crates up
@@ -47,9 +47,9 @@ struct SharedState {
     /// tmp/<key>/lib so downstream can read the early rmeta).
     output_map: BTreeMap<String, PathBuf>,
     /// drv_paths whose rmeta has been signalled. The fd-3 signal and the
-    /// post-success catch-up both call `fire_rmeta`; this set guarantees
+    /// post-success catch-up both call `fire_early`; this set guarantees
     /// idempotence so dependents are decremented exactly once.
-    rmeta_fired: HashSet<String>,
+    early_fired: HashSet<String>,
     succeeded: usize,
     cached: usize,
     failed: usize,
@@ -59,23 +59,23 @@ struct SharedState {
 
 impl SharedState {
     fn maybe_ready(&mut self, drv: &str) {
-        if self.pending_rmeta.get(drv).copied() == Some(0)
+        if self.pending_early.get(drv).copied() == Some(0)
             && self.pending_done.get(drv).copied() == Some(0)
         {
             // Guard against double-push: remove from pending maps.
-            self.pending_rmeta.remove(drv);
+            self.pending_early.remove(drv);
             self.pending_done.remove(drv);
             self.ready.push(drv.to_string());
         }
     }
 
-    fn fire_rmeta(&mut self, dep: &str) {
-        if !self.rmeta_fired.insert(dep.to_string()) {
+    fn fire_early(&mut self, dep: &str) {
+        if !self.early_fired.insert(dep.to_string()) {
             return;
         }
-        if let Some(ds) = self.rmeta_dependents.remove(dep) {
+        if let Some(ds) = self.early_dependents.remove(dep) {
             for d in ds {
-                if let Some(c) = self.pending_rmeta.get_mut(&d) {
+                if let Some(c) = self.pending_early.get_mut(&d) {
                     *c -= 1;
                 }
                 self.maybe_ready(&d);
@@ -145,9 +145,9 @@ pub fn run_parallel(
         .map(|(k, n)| (k.clone(), pl.is_some_and(|p| p.is_pipelineable(&n.drv))))
         .collect();
 
-    let mut pending_rmeta: HashMap<String, usize> = HashMap::new();
+    let mut pending_early: HashMap<String, usize> = HashMap::new();
     let mut pending_done: HashMap<String, usize> = HashMap::new();
-    let mut rmeta_dependents: HashMap<String, Vec<String>> = HashMap::new();
+    let mut early_dependents: HashMap<String, Vec<String>> = HashMap::new();
     let mut done_dependents: HashMap<String, Vec<String>> = HashMap::new();
     let mut output_map: BTreeMap<String, PathBuf> = BTreeMap::new();
     let mut ready: Vec<String> = Vec::new();
@@ -171,12 +171,12 @@ pub fn run_parallel(
             .filter(|dep| !is_cached(dep, &graph.nodes[dep.as_str()]))
             .collect();
 
-        let mut n_rmeta = 0usize;
+        let mut n_early = 0usize;
         let mut n_done = 0usize;
         for dep in &uncached_deps {
             if *pipelineable.get(dep.as_str()).unwrap_or(&false) {
-                n_rmeta += 1;
-                rmeta_dependents
+                n_early += 1;
+                early_dependents
                     .entry((*dep).clone())
                     .or_default()
                     .push(drv_path.clone());
@@ -188,10 +188,10 @@ pub fn run_parallel(
                     .push(drv_path.clone());
             }
         }
-        pending_rmeta.insert(drv_path.clone(), n_rmeta);
+        pending_early.insert(drv_path.clone(), n_early);
         pending_done.insert(drv_path.clone(), n_done);
 
-        if n_rmeta == 0 && n_done == 0 {
+        if n_early == 0 && n_done == 0 {
             ready.push(drv_path.clone());
         }
     }
@@ -205,12 +205,12 @@ pub fn run_parallel(
     let state = Arc::new((
         Mutex::new(SharedState {
             ready,
-            pending_rmeta,
+            pending_early,
             pending_done,
-            rmeta_dependents,
+            early_dependents,
             done_dependents,
             output_map,
-            rmeta_fired: HashSet::new(),
+            early_fired: HashSet::new(),
             succeeded: 0,
             cached: 0,
             failed: 0,
@@ -347,9 +347,9 @@ fn worker_loop(
             &rewriter,
             worker,
             src_ov,
-            |_rmeta_dir| {
+            |_early_dir| {
                 let mut s = lock.lock().unwrap();
-                s.fire_rmeta(&drv_path);
+                s.fire_early(&drv_path);
                 cvar.notify_all();
             },
         );
@@ -372,8 +372,8 @@ fn worker_loop(
                     // Catch-up for crates that never signalled rmeta (proc-
                     // macros, bin-only, build.rs probe with no lib target,
                     // crates with `links`): unblock rmeta-waiters now.
-                    // `rmeta_fired` makes this idempotent if fd-3 already fired.
-                    s.fire_rmeta(&drv_path);
+                    // `early_fired` makes this idempotent if fd-3 already fired.
+                    s.fire_early(&drv_path);
 
                     if let Some(ds) = s.done_dependents.remove(&drv_path) {
                         for d in ds {

@@ -186,31 +186,35 @@ mod tests {
 
     #[test]
     fn attrs_sh_shapes() {
+        // Key names are arbitrary; we're testing the bash-declaration shapes
+        // (scalar / -a / -A) and the simple-type coercion, not any builder's
+        // schema. `outputs` and `env` use the real names because stdenv/setup
+        // iterates exactly those.
         let json = serde_json::json!({
-            "crateName": "foo",
+            "name": "foo",
             "release": true,
-            "codegenUnits": 16,
+            "jobs": 16,
             "nativeBuildInputs": ["/nix/store/a", "/nix/store/b"],
             "outputs": {"out": "/tmp/out", "lib": "/tmp/lib"},
-            "env": {"AWS_LC_SYS_CMAKE_BUILDER": 1, "NIX_MAIN_PROGRAM": "foo"},
-            "crateBin": [{"name": "x"}],   // nested → skipped
+            "env": {"SOME_INT": 1, "NIX_MAIN_PROGRAM": "foo"},
+            "nested": [{"x": 1}],          // nested → skipped
             "bad-key": "nope",             // invalid ident → skipped
             "quoted": "it's fine",
             "nullish": null,
         });
         let sh = json_to_attrs_sh(&json);
-        assert!(sh.contains("declare crateName='foo'\n"));
+        assert!(sh.contains("declare name='foo'\n"));
         assert!(sh.contains("declare release=1\n"));
-        assert!(sh.contains("declare codegenUnits=16\n"));
+        assert!(sh.contains("declare jobs=16\n"));
         assert!(sh.contains("declare -a nativeBuildInputs=('/nix/store/a' '/nix/store/b' )\n"));
         assert!(sh.contains("declare -A outputs=("));
         assert!(sh.contains("['out']='/tmp/out'"));
         assert!(sh.contains("['lib']='/tmp/lib'"));
         // env with mixed int/string values must NOT be skipped
         assert!(sh.contains("declare -A env=("));
-        assert!(sh.contains("['AWS_LC_SYS_CMAKE_BUILDER']=1"));
+        assert!(sh.contains("['SOME_INT']=1"));
         assert!(sh.contains("['NIX_MAIN_PROGRAM']='foo'"));
-        assert!(!sh.contains("crateBin"));
+        assert!(!sh.contains("nested"));
         assert!(!sh.contains("bad-key"));
         assert!(sh.contains("declare quoted='it'\\''s fine'\n"));
         assert!(sh.contains("declare nullish=''\n"));

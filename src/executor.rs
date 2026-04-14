@@ -271,16 +271,19 @@ exit $rc
         // stay so embedded metadata paths and the wrapper's done-poll keep
         // resolving for the rest of this run.
         let _ = std::fs::remove_dir_all(&work_dir);
-        let _ = std::fs::remove_dir_all(tmp.join("rustc-wrap"));
-        for f in [
-            "builder.sh",
-            "env.sh",
-            ".attrs.sh",
-            ".attrs.json",
-            "worker-stdout",
-            "worker-stderr",
-        ] {
-            let _ = std::fs::remove_file(tmp.join(f));
+        // Backend hooks may leave arbitrary scratch (wrapper-shim dirs, etc.)
+        // under tmp/. Keep only the subtrees that downstream resolution needs.
+        if let Ok(rd) = std::fs::read_dir(&tmp) {
+            for e in rd.flatten() {
+                if matches!(
+                    e.file_name().to_str(),
+                    Some("lib" | "out" | "rmeta" | "done")
+                ) {
+                    continue;
+                }
+                let _ = std::fs::remove_dir_all(e.path());
+                let _ = std::fs::remove_file(e.path());
+            }
         }
     }
 
@@ -293,7 +296,8 @@ exit $rc
 }
 
 /// Recursive hardlink-copy (same-fs `cp -al`, without the fork). Only the
-/// `lib`, `out`, and `rmeta` subtrees are persisted; `build/` (NIX_BUILD_TOP,
+/// `lib`, `out`, and `rmeta` (early-artifact) subtrees are persisted;
+/// `build/` (NIX_BUILD_TOP,
 /// often hundreds of MB of unpacked source + .o files) is intentionally
 /// skipped — the bash `cp -al` was hardlinking it too, which is cheap on disk
 /// but still walks every file.

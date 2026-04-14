@@ -59,15 +59,14 @@ mod tests {
             "/home/user/.cache/nib/out/hello-0.1.0".into(),
         );
 
-        let input = "--extern serde=/nix/store/aaaa-serde-1.0.0-lib/lib/libserde.rlib";
-        let result = rw.rewrite(input);
+        let input = "-L /nix/store/aaaa-serde-1.0.0-lib/lib";
         assert_eq!(
-            result,
-            "--extern serde=/home/user/.cache/nib/artifacts/serde-1.0.0/lib/libserde.rlib"
+            rw.rewrite(input),
+            "-L /home/user/.cache/nib/artifacts/serde-1.0.0/lib"
         );
 
-        // Toolchain paths should pass through untouched
-        let toolchain = "/nix/store/cccc-rustc-1.92.0/bin/rustc";
+        // Unmapped store paths pass through untouched
+        let toolchain = "/nix/store/cccc-gcc-15.2.0/bin/cc";
         assert_eq!(rw.rewrite(toolchain), toolchain);
     }
 

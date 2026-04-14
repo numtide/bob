@@ -1,9 +1,5 @@
 //! Rust language backend: `buildRustCrate` drvs via cargo-nix-plugin.
 
-// Wired up in the follow-up "route everything through BACKEND" commit; until
-// then the trait impl and its helpers are intentionally unreferenced.
-#![allow(dead_code)]
-
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;

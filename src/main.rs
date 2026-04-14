@@ -12,12 +12,13 @@ mod rust;
 mod scheduler;
 mod worker;
 
+use std::path::Path;
+use std::path::PathBuf;
+
 use backend::Backend;
 use cache::ArtifactCache;
 
 static BACKEND: rust::RustBackend = rust::RustBackend;
-use std::path::Path;
-use std::path::PathBuf;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -27,9 +28,15 @@ fn main() {
     }
 
     match args[1].as_str() {
-        // Internal: rmeta-pipelining rustc shim. Dispatched first because it's
-        // the hot path — invoked once per rustc call inside builds.
-        "__rustc-wrap" => rust::rustc_wrap::main(&args[2..]),
+        // Internal wrapper-shim re-entries (`bob __<backend>-wrap …`).
+        // Dispatched first — hot path, invoked once per compiler call.
+        cmd if cmd.starts_with("__") => {
+            if BACKEND.dispatch_internal(cmd, &args[2..]) {
+                unreachable!("dispatch_internal must exit when it returns true");
+            }
+            eprintln!("unknown internal command: {cmd}");
+            std::process::exit(1);
+        }
         "build" => cmd_build(&args[2..]),
         "clean" => cmd_clean(&args[2..]),
         "status" => cmd_status(),
@@ -46,7 +53,7 @@ fn main() {
 }
 
 fn print_usage() {
-    eprintln!("bob — fast Rust builds via Nix drv replay + caching");
+    eprintln!("Bob the Builder — fast incremental builds via Nix drv replay + caching");
     eprintln!();
     eprintln!("usage: bob <command> [args...]");
     eprintln!();
@@ -175,9 +182,10 @@ fn cmd_build(args: &[String]) {
     // Realize any missing source tarballs / build inputs
     g.realize_inputs().expect("realizing inputs");
 
-    // Build per-crate source overrides with cascading invalidation.
-    // See compute_workspace_overrides() for the algorithm.
-    let overrides = compute_workspace_overrides(&repo_root, &g);
+    // Per-unit source overrides with cascading invalidation; see
+    // overrides::cascade for the algorithm. The backend supplies
+    // own-source hashes for its workspace units.
+    let overrides = overrides::cascade(&g, BACKEND.workspace_unit_hashes(&repo_root, &g));
 
     if dump_keys {
         for (drv, node) in &g.nodes {
@@ -185,13 +193,7 @@ fn cmd_build(args: &[String]) {
                 Some(ov) => ArtifactCache::cache_key_with_source(drv, &ov.source_hash),
                 None => ArtifactCache::cache_key(drv),
             };
-            let name = node
-                .drv
-                .env
-                .get("crateName")
-                .map(String::as_str)
-                .unwrap_or("?");
-            println!("{key} {name} {drv}");
+            println!("{key} {} {drv}", BACKEND.unit_name(&node.drv));
         }
         return;
     }
@@ -241,15 +243,6 @@ fn cmd_build(args: &[String]) {
     if result.failed > 0 {
         std::process::exit(1);
     }
-}
-
-/// Locate every workspace crate in the graph and hash its source dir, then
-/// cascade through the DAG.
-fn compute_workspace_overrides(
-    repo_root: &Path,
-    g: &graph::BuildGraph,
-) -> std::collections::HashMap<String, executor::SourceOverride> {
-    overrides::cascade(g, rust::workspace::unit_hashes(repo_root, g))
 }
 
 fn cmd_clean(args: &[String]) {
@@ -398,24 +391,13 @@ fn cmd_graph(args: &[String]) {
     let roots: Vec<String> = args.to_vec();
     match graph::BuildGraph::from_roots(&roots, |d| BACKEND.is_unit(d)) {
         Ok(g) => {
-            println!("crates in graph: {}", g.unit_count());
+            println!("units in graph: {}", g.unit_count());
             println!("topological order:");
             for (i, drv_path) in g.topo_order.iter().enumerate() {
                 let node = &g.nodes[drv_path];
-                let name = node
-                    .drv
-                    .env
-                    .get("crateName")
-                    .map(|s| s.as_str())
-                    .unwrap_or("?");
-                let version = node
-                    .drv
-                    .env
-                    .get("crateVersion")
-                    .unwrap_or(&String::new())
-                    .clone();
+                let name = BACKEND.unit_name(&node.drv);
                 let ndeps = node.unit_deps.len();
-                println!("  {i:3}. {name}-{version} ({ndeps} deps)");
+                println!("  {i:3}. {name} ({ndeps} deps)");
             }
         }
         Err(e) => {
