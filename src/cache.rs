@@ -4,7 +4,7 @@
 //! (source hash, dep hashes, rustc flags, features) via Nix's own hashing.
 //!
 //! Layout:
-//!   $XDG_CACHE_HOME/nix-inc/
+//!   $XDG_CACHE_HOME/bob/
 //!     artifacts/<blake3-of-drv-path>/
 //!       out/    — corresponds to $out
 //!       lib/    — corresponds to $lib
@@ -18,13 +18,12 @@ pub struct ArtifactCache {
 
 impl ArtifactCache {
     pub fn new() -> Self {
-        let cache_dir = std::env::var("XDG_CACHE_HOME")
-            .unwrap_or_else(|_| {
-                let home = std::env::var("HOME").expect("HOME not set");
-                format!("{home}/.cache")
-            });
+        let cache_dir = std::env::var("XDG_CACHE_HOME").unwrap_or_else(|_| {
+            let home = std::env::var("HOME").expect("HOME not set");
+            format!("{home}/.cache")
+        });
         Self {
-            root: PathBuf::from(cache_dir).join("nix-inc"),
+            root: PathBuf::from(cache_dir).join("bob"),
         }
     }
 
@@ -127,7 +126,9 @@ impl ArtifactCache {
     /// the incremental dir persists across builds so rustc can
     /// reuse compilation state.
     pub fn incremental_dir(&self, drv_path: &str) -> PathBuf {
-        self.root.join("incremental").join(Self::cache_key(drv_path))
+        self.root
+            .join("incremental")
+            .join(Self::cache_key(drv_path))
     }
 }
 

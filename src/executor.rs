@@ -44,7 +44,7 @@ pub struct PipelineConfig {
 /// `source_hash` is the *effective* hash: it incorporates this crate's own
 /// source content AND the effective hashes of all its workspace deps. This
 /// cascades invalidation through the DAG without changing drv paths, so a
-/// change to `foo/src/lib.rs` produces a new key for foo and
+/// change to a workspace crate's source produces a new key for that crate and
 /// every downstream workspace crate, while crates.io deps (which never sit
 /// downstream of workspace crates) keep their plain `blake3(drv_path)` key.
 #[derive(Clone, Debug)]
@@ -82,7 +82,9 @@ pub fn build_crate(
     rewriter: &PathRewriter,
     stdenv_dump: Option<&Path>,
 ) -> Result<BuildResult, String> {
-    let crate_name = drv.env.get("crateName")
+    let crate_name = drv
+        .env
+        .get("crateName")
         .cloned()
         .unwrap_or_else(|| "unknown".into());
     let start = std::time::Instant::now();
@@ -100,15 +102,15 @@ pub fn build_crate(
         });
     }
 
-    let tmp = cache.prepare_tmp(drv_path)
+    let tmp = cache
+        .prepare_tmp(drv_path)
         .map_err(|e| format!("preparing tmp dir: {e}"))?;
 
     // Rewrite all env vars
     let env = rewriter.rewrite_env(&drv.env);
 
     // Build the shell script that sources stdenv and runs the build
-    let stdenv_path = env.get("stdenv")
-        .ok_or("drv missing 'stdenv' env var")?;
+    let stdenv_path = env.get("stdenv").ok_or("drv missing 'stdenv' env var")?;
     let setup_path = format!("{stdenv_path}/setup");
 
     // Write the build script to a file, matching nix's invocation:
@@ -117,14 +119,12 @@ pub fn build_crate(
     // and default-builder.sh does: genericBuild
     let script_path = tmp.join("builder.sh");
     let script = build_script(&env, &setup_path, &tmp, stdenv_dump);
-    std::fs::write(&script_path, &script)
-        .map_err(|e| format!("writing build script: {e}"))?;
+    std::fs::write(&script_path, &script).map_err(|e| format!("writing build script: {e}"))?;
 
     let bash = &drv.builder;
 
     let mut cmd = Command::new(bash);
-    cmd.arg("-e")
-        .arg(&script_path);
+    cmd.arg("-e").arg(&script_path);
 
     // Set a clean environment, then add the drv's env vars
     cmd.env_clear();
@@ -140,8 +140,7 @@ pub fn build_crate(
 
     // Set NIX_BUILD_TOP to a working directory
     let work_dir = tmp.join("build");
-    std::fs::create_dir_all(&work_dir)
-        .map_err(|e| format!("creating work dir: {e}"))?;
+    std::fs::create_dir_all(&work_dir).map_err(|e| format!("creating work dir: {e}"))?;
     cmd.env("NIX_BUILD_TOP", work_dir.to_str().unwrap());
     cmd.env("TMPDIR", work_dir.to_str().unwrap());
     cmd.env("TEMPDIR", work_dir.to_str().unwrap());
@@ -150,9 +149,7 @@ pub fn build_crate(
     cmd.current_dir(&work_dir);
 
     // Provide outputs list
-    let outputs = env.get("outputs")
-        .cloned()
-        .unwrap_or_else(|| "out".into());
+    let outputs = env.get("outputs").cloned().unwrap_or_else(|| "out".into());
     cmd.env("outputs", &outputs);
 
     // HOME is needed by some build scripts
@@ -165,7 +162,8 @@ pub fn build_crate(
     // but our cached artifacts live in ~/.cache/
     cmd.env("NIX_ENFORCE_PURITY", "0");
 
-    let output = cmd.output()
+    let output = cmd
+        .output()
         .map_err(|e| format!("executing build for {crate_name}: {e}"))?;
 
     let success = output.status.success();
@@ -174,7 +172,8 @@ pub fn build_crate(
     if !success {
         let _ = std::fs::remove_dir_all(&tmp);
     } else {
-        cache.commit(drv_path)
+        cache
+            .commit(drv_path)
             .map_err(|e| format!("committing {crate_name} to cache: {e}"))?;
     }
 
@@ -225,7 +224,6 @@ echo "__TIMING__ setup=$((_t1-_t0))0ms phases=$((_t2-_t1))0ms" >&2
     )
 }
 
-
 /// Build a crate using a persistent worker (stdenv already sourced).
 /// The worker forks a subshell per build, saving ~40ms of stdenv sourcing.
 pub fn build_crate_with_worker(
@@ -243,7 +241,9 @@ pub fn build_crate_with_worker(
         Some(ov) => ArtifactCache::cache_key_with_source(drv_path, &ov.source_hash),
         None => ArtifactCache::cache_key(drv_path),
     };
-    let crate_name = drv.env.get("crateName")
+    let crate_name = drv
+        .env
+        .get("crateName")
         .cloned()
         .unwrap_or_else(|| "unknown".into());
     let start = std::time::Instant::now();
@@ -262,11 +262,9 @@ pub fn build_crate_with_worker(
 
     let tmp_dir = cache.root().join("tmp").join(&effective_key);
     if tmp_dir.exists() {
-        std::fs::remove_dir_all(&tmp_dir)
-            .map_err(|e| format!("removing old tmp: {e}"))?;
+        std::fs::remove_dir_all(&tmp_dir).map_err(|e| format!("removing old tmp: {e}"))?;
     }
-    std::fs::create_dir_all(&tmp_dir)
-        .map_err(|e| format!("creating tmp dir: {e}"))?;
+    std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("creating tmp dir: {e}"))?;
     let tmp = tmp_dir;
     let env = rewriter.rewrite_env(&drv.env);
 
@@ -287,8 +285,7 @@ pub fn build_crate_with_worker(
             let escaped = escape_for_dollar_single_quote(v);
             ef.push_str(&format!("export {k}=$'{escaped}'\n"));
         }
-        std::fs::write(&env_file, &ef)
-            .map_err(|e| format!("writing env file: {e}"))?;
+        std::fs::write(&env_file, &ef).map_err(|e| format!("writing env file: {e}"))?;
     }
     script.push_str(&format!("source '{}'\n", env_file.display()));
 
@@ -324,8 +321,7 @@ pub fn build_crate_with_worker(
     // Enable incremental compilation: rustc reuses previous work
     // from this persistent dir across rebuilds of the same crate.
     let inc_dir = cache.incremental_dir(drv_path);
-    std::fs::create_dir_all(&inc_dir)
-        .map_err(|e| format!("creating incremental dir: {e}"))?;
+    std::fs::create_dir_all(&inc_dir).map_err(|e| format!("creating incremental dir: {e}"))?;
     script.push_str(&format!(
         "export EXTRA_RUSTC_FLAGS=\"-C incremental={} ${{EXTRA_RUSTC_FLAGS:-}}\"\n",
         inc_dir.display()
@@ -334,16 +330,11 @@ pub fn build_crate_with_worker(
     // Pipelining: tell build-rust-crate where to emit .rmeta and to
     // signal readiness via fd 3 (inherited from the worker).
     let rmeta_dir = cache.root().join("rmeta").join(&effective_key);
-    std::fs::create_dir_all(&rmeta_dir)
-        .map_err(|e| format!("creating rmeta dir: {e}"))?;
-    script.push_str(&format!(
-        "export NIX_INC_RMETA_DIR='{}'\n",
-        rmeta_dir.display()
-    ));
+    std::fs::create_dir_all(&rmeta_dir).map_err(|e| format!("creating rmeta dir: {e}"))?;
+    script.push_str(&format!("export BOB_RMETA_DIR='{}'\n", rmeta_dir.display()));
 
     let work_dir = tmp.join("build");
-    std::fs::create_dir_all(&work_dir)
-        .map_err(|e| format!("creating work dir: {e}"))?;
+    std::fs::create_dir_all(&work_dir).map_err(|e| format!("creating work dir: {e}"))?;
     script.push_str(&format!("export NIX_BUILD_TOP='{}'\n", work_dir.display()));
     script.push_str(&format!("export TMPDIR='{}'\n", work_dir.display()));
     script.push_str(&format!("export TEMPDIR='{}'\n", work_dir.display()));
@@ -351,9 +342,7 @@ pub fn build_crate_with_worker(
     script.push_str(&format!("export TEMP='{}'\n", work_dir.display()));
     script.push_str(&format!("export HOME='/homeless-shelter'\n"));
 
-    let outputs = env.get("outputs")
-        .cloned()
-        .unwrap_or_else(|| "out".into());
+    let outputs = env.get("outputs").cloned().unwrap_or_else(|| "out".into());
     script.push_str(&format!("export outputs='{outputs}'\n"));
     script.push_str("export dontFixup=1\n");
     script.push_str(&format!("cd '{}'\n", work_dir.display()));
@@ -361,17 +350,20 @@ pub fn build_crate_with_worker(
     // Re-process nativeBuildInputs into PATH. The worker's parent sourced
     // stdenv with empty nativeBuildInputs; we need to add the crate's
     // toolchain (rustc, cargo, gcc-wrapper, mold, etc.) to PATH.
-    script.push_str(r#"
+    script.push_str(
+        r#"
 for p in $nativeBuildInputs $depsBuildBuild; do
   if [ -d "$p/bin" ]; then
     export PATH="$p/bin:$PATH"
   fi
 done
-"#);
+"#,
+    );
 
     // Use genericBuild but skip the per-phase overhead (dumpVars,
     // showPhaseHeader/Footer, date calls) by overriding those to no-ops.
-    script.push_str(r#"
+    script.push_str(
+        r#"
 dumpVars() { :; }
 showPhaseHeader() { :; }
 showPhaseFooter() { :; }
@@ -381,20 +373,22 @@ _t0=$(_ms)
 genericBuild
 _t1=$(_ms)
 echo "__TIMING__ phases=$((_t1-_t0))0ms" >&2
-"#);
+"#,
+    );
 
     let script_path = tmp.join("builder.sh");
-    std::fs::write(&script_path, &script)
-        .map_err(|e| format!("writing build script: {e}"))?;
+    std::fs::write(&script_path, &script).map_err(|e| format!("writing build script: {e}"))?;
 
-    let result = worker.execute(&script_path, &tmp)
+    let result = worker
+        .execute(&script_path, &tmp)
         .map_err(|e| format!("worker build {crate_name}: {e}"))?;
 
     let success = result.exit_code == 0;
     if !success {
         let _ = std::fs::remove_dir_all(&tmp);
     } else {
-        cache.commit_key(&effective_key)
+        cache
+            .commit_key(&effective_key)
             .map_err(|e| format!("committing {crate_name} to cache: {e}"))?;
     }
 
@@ -425,7 +419,9 @@ pub fn build_crate_with_worker_signaled(
         Some(ov) => ArtifactCache::cache_key_with_source(drv_path, &ov.source_hash),
         None => ArtifactCache::cache_key(drv_path),
     };
-    let crate_name = drv.env.get("crateName")
+    let crate_name = drv
+        .env
+        .get("crateName")
         .cloned()
         .unwrap_or_else(|| "unknown".into());
     let start = std::time::Instant::now();
@@ -485,14 +481,13 @@ pub fn build_crate_with_worker_signaled(
             let escaped = escape_for_dollar_single_quote(v);
             ef.push_str(&format!("export {k}=$'{escaped}'\n"));
         }
-        std::fs::write(&env_file, &ef)
-            .map_err(|e| format!("writing env file: {e}"))?;
+        std::fs::write(&env_file, &ef).map_err(|e| format!("writing env file: {e}"))?;
     }
     script.push_str(&format!("source '{}'\n", env_file.display()));
 
     // Override src with local worktree dir when reusing a cached drv across
     // source changes. unpackPhase will copy it into NIX_BUILD_TOP; the live
-    // dir only ever contains a tiny target/.nix-inc-mtime-cache (cargo's real
+    // dir only ever contains a tiny target/.bob-mtime-cache (cargo's real
     // target dir is workspace-level), so no filtered snapshot is needed.
     if let Some(ov) = src_override {
         if let Some(ref p) = ov.src_path {
@@ -523,8 +518,7 @@ pub fn build_crate_with_worker_signaled(
     }
 
     let inc_dir = cache.incremental_dir(drv_path);
-    std::fs::create_dir_all(&inc_dir)
-        .map_err(|e| format!("creating incremental dir: {e}"))?;
+    std::fs::create_dir_all(&inc_dir).map_err(|e| format!("creating incremental dir: {e}"))?;
     script.push_str(&format!(
         "export EXTRA_RUSTC_FLAGS=\"-C incremental={} ${{EXTRA_RUSTC_FLAGS:-}}\"\n",
         inc_dir.display()
@@ -537,10 +531,12 @@ pub fn build_crate_with_worker_signaled(
     // value moves with it and rustc invalidates the whole incremental session
     // — paying dep-graph serialisation for nothing. Keying on drv_path (same
     // key incremental_dir uses) keeps both stable across source edits.
-    let work_dir = cache.root().join("build").join(ArtifactCache::cache_key(drv_path));
+    let work_dir = cache
+        .root()
+        .join("build")
+        .join(ArtifactCache::cache_key(drv_path));
     let _ = std::fs::remove_dir_all(&work_dir);
-    std::fs::create_dir_all(&work_dir)
-        .map_err(|e| format!("creating work dir: {e}"))?;
+    std::fs::create_dir_all(&work_dir).map_err(|e| format!("creating work dir: {e}"))?;
     script.push_str(&format!("export NIX_BUILD_TOP='{}'\n", work_dir.display()));
     script.push_str(&format!("export TMPDIR='{}'\n", work_dir.display()));
     script.push_str(&format!("export TEMPDIR='{}'\n", work_dir.display()));
@@ -548,9 +544,7 @@ pub fn build_crate_with_worker_signaled(
     script.push_str(&format!("export TEMP='{}'\n", work_dir.display()));
     script.push_str("export HOME='/homeless-shelter'\n");
 
-    let outputs = env.get("outputs")
-        .cloned()
-        .unwrap_or_else(|| "out".into());
+    let outputs = env.get("outputs").cloned().unwrap_or_else(|| "out".into());
     script.push_str(&format!("export outputs='{outputs}'\n"));
     script.push_str("export dontFixup=1\n");
     script.push_str(&format!("cd '{}'\n", work_dir.display()));
@@ -572,17 +566,15 @@ source "$stdenv/setup"
     );
 
     // Pipelining: wrap rustc to emit a fat rmeta early and signal via fd 3.
-    // The wrapper is the nix-inc binary itself (`__rustc-wrap`, see
+    // The wrapper is the bob binary itself (`__rustc-wrap`, see
     // rustc_wrap.rs), so arg classification, JSON-stderr parsing, and
     // rmeta→rlib polling happen in Rust without forking jq/cp/mv per line.
     // This /bin/sh shim just bridges PATH lookup of `rustc` to the subcommand.
     {
         let wrapper_dir = tmp.join("rustc-wrap");
-        std::fs::create_dir_all(&wrapper_dir)
-            .map_err(|e| format!("creating wrapper dir: {e}"))?;
+        std::fs::create_dir_all(&wrapper_dir).map_err(|e| format!("creating wrapper dir: {e}"))?;
         let wrapper = wrapper_dir.join("rustc");
-        let self_exe = std::env::current_exe()
-            .map_err(|e| format!("resolving self exe: {e}"))?;
+        let self_exe = std::env::current_exe().map_err(|e| format!("resolving self exe: {e}"))?;
         std::fs::write(
             &wrapper,
             format!(
@@ -596,19 +588,19 @@ source "$stdenv/setup"
         perms.set_mode(0o755);
         std::fs::set_permissions(&wrapper, perms).ok();
 
-        // Config for rustc_wrap::main(). NIXINC_REAL_RUSTC is resolved AFTER
+        // Config for rustc_wrap::main(). BOB_REAL_RUSTC is resolved AFTER
         // `source $stdenv/setup` so PATH already has the toolchain.
         // completeDeps/completeBuildDeps come from env.sh (already rewritten).
-        // Intentionally NOT `NIX_INC_RMETA_DIR`: build-rust-crate keys its
+        // Intentionally NOT `BOB_RMETA_DIR`: build-rust-crate keys its
         // post-build `--emit=metadata` pass + fd-3 signal off that var. The
         // wrapper already signalled mid-build, so that second rustc call would
         // be ~50ms of redundant work per crate.
         script.push_str(&format!(
             concat!(
-                "export NIXINC_REAL_RUSTC=$(command -v rustc)\n",
-                "export NIXINC_RMETA_DIR='{rmeta_dir}'\n",
-                "export NIXINC_EXPECTED_RMETA='{expected}'\n",
-                "export NIXINC_SKIP_LINK_PASS='{skip_link}'\n",
+                "export BOB_REAL_RUSTC=$(command -v rustc)\n",
+                "export BOB_WRAP_RMETA_DIR='{rmeta_dir}'\n",
+                "export BOB_EXPECTED_RMETA='{expected}'\n",
+                "export BOB_SKIP_LINK_PASS='{skip_link}'\n",
                 "export PATH='{wrap}':$PATH\n",
             ),
             rmeta_dir = tmp.join("rmeta").display(),
@@ -645,10 +637,10 @@ exit $rc
     );
 
     let script_path = tmp.join("builder.sh");
-    std::fs::write(&script_path, &script)
-        .map_err(|e| format!("writing build script: {e}"))?;
+    std::fs::write(&script_path, &script).map_err(|e| format!("writing build script: {e}"))?;
 
-    let result = worker.execute_with_signal(&script_path, &tmp, on_meta_ready)
+    let result = worker
+        .execute_with_signal(&script_path, &tmp, on_meta_ready)
         .map_err(|e| format!("worker build {crate_name}: {e}"))?;
 
     // genericBuild's exit code is unreliable across stdenv versions (errexit
@@ -770,8 +762,14 @@ fn rewrite_structured_attrs_json(
         // In the __json blob, outputs is just ["out", "lib"] (names only).
         // The build-rust-crate binary expects {"out": "/path", "lib": "/path"}.
         let mut outputs_map = serde_json::Map::new();
-        outputs_map.insert("out".into(), serde_json::Value::String(out_path.to_string()));
-        outputs_map.insert("lib".into(), serde_json::Value::String(lib_path.to_string()));
+        outputs_map.insert(
+            "out".into(),
+            serde_json::Value::String(out_path.to_string()),
+        );
+        outputs_map.insert(
+            "lib".into(),
+            serde_json::Value::String(lib_path.to_string()),
+        );
         map.insert("outputs".into(), serde_json::Value::Object(outputs_map));
 
         // Rewrite all string values that contain /nix/store paths
@@ -781,7 +779,10 @@ fn rewrite_structured_attrs_json(
     serde_json::to_string(&val).unwrap_or_else(|_| json_str.to_string())
 }
 
-fn rewrite_json_values(map: &mut serde_json::Map<String, serde_json::Value>, rewriter: &PathRewriter) {
+fn rewrite_json_values(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    rewriter: &PathRewriter,
+) {
     for (_key, val) in map.iter_mut() {
         match val {
             serde_json::Value::String(s) => {
@@ -829,10 +830,7 @@ fn escape_for_dollar_single_quote(s: &str) -> String {
 
 /// Build a PathRewriter for a crate given its drv and the cache locations
 /// of its dependencies.
-pub fn make_rewriter(
-    _drv: &Derivation,
-    dep_cache_map: &BTreeMap<String, PathBuf>,
-) -> PathRewriter {
+pub fn make_rewriter(_drv: &Derivation, dep_cache_map: &BTreeMap<String, PathBuf>) -> PathRewriter {
     let mut rw = PathRewriter::new();
 
     // Rewrite dependency output paths

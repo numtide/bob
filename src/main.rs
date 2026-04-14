@@ -40,9 +40,9 @@ fn main() {
 }
 
 fn print_usage() {
-    eprintln!("nix-inc — fast Rust builds via Nix drv replay + caching");
+    eprintln!("bob — fast Rust builds via Nix drv replay + caching");
     eprintln!();
-    eprintln!("usage: nix-inc <command> [args...]");
+    eprintln!("usage: bob <command> [args...]");
     eprintln!();
     eprintln!("commands:");
     eprintln!("  build [opts] <target>...   Build workspace members or drv paths");
@@ -58,19 +58,26 @@ fn print_usage() {
     eprintln!();
     eprintln!("build options:");
     eprintln!("  -j N                       Parallel jobs (default: nproc)");
-    eprintln!("  --repo-root <path>         Monorepo root (default: auto-detect)");
+    eprintln!("  --repo-root <path>         Repo root containing bob.nix (default: auto-detect)");
 }
 
-/// Find the monorepo root by walking up from cwd looking for bob.nix.
+/// Find the repo root by walking up from cwd looking for `bob.nix`.
+/// `bob.nix` is the per-repo glue that exposes
+/// `workspaceMembers.<name>.build` for nix-instantiate resolution.
 fn find_repo_root() -> Result<PathBuf, String> {
+    if let Ok(r) = std::env::var("BOB_REPO_ROOT") {
+        return Ok(PathBuf::from(r));
+    }
     let mut dir = std::env::current_dir().map_err(|e| format!("getting cwd: {e}"))?;
-
     loop {
         if dir.join("bob.nix").exists() {
             return Ok(dir);
         }
         if !dir.pop() {
-            return Err("could not find monorepo root (looking for bob.nix)".into());
+            return Err(
+                "could not find repo root (no bob.nix found); pass --repo-root or set BOB_REPO_ROOT"
+                    .into(),
+            );
         }
     }
 }
@@ -163,7 +170,7 @@ fn find_output_binaries(cache: &ArtifactCache, drv_path: &str) -> Vec<PathBuf> {
 
 fn cmd_build(args: &[String]) {
     if args.is_empty() {
-        eprintln!("usage: nix-inc build [-j N] [--repo-root <path>] <target>...");
+        eprintln!("usage: bob build [-j N] [--repo-root <path>] <target>...");
         std::process::exit(1);
     }
 
@@ -187,7 +194,7 @@ fn cmd_build(args: &[String]) {
             }
             // Print `<effective-cache-key> <crateName> <drv-path>` for every
             // crate in the graph and exit. Used by the bench harness to seed
-            // workspace crates whose build scripts nix-inc can't replay.
+            // workspace crates whose build scripts bob can't replay.
             "--dump-keys" => dump_keys = true,
             other => targets.push(other.to_string()),
         }
@@ -197,7 +204,7 @@ fn cmd_build(args: &[String]) {
     let cache = ArtifactCache::new();
     let repo_root = repo_root
         .or_else(|| find_repo_root().ok())
-        .expect("could not find monorepo root — pass --repo-root or cd into the repo");
+        .expect("could not find repo root — pass --repo-root, set BOB_REPO_ROOT, or add a bob.nix");
 
     // Resolve all targets
     let mut resolve_results: Vec<resolve::ResolveResult> = Vec::new();
@@ -319,8 +326,8 @@ fn cmd_build(args: &[String]) {
 ///     nix store.
 ///  3. Emitting a SourceOverride for every crate with an effective hash,
 ///     pointing `src` at the live worktree dir. The scheduler then uses
-///     `cache_key_with_source(drv, eff)` for these crates: a change to
-///     `foo/src/lib.rs` produces a new key for foo *and* every
+///     `cache_key_with_source(drv, eff)` for these crates: editing one
+///     workspace crate's source produces a new key for it *and* every
 ///     downstream workspace crate, while everything else stays cached.
 fn compute_workspace_overrides(
     repo_root: &Path,
@@ -330,7 +337,7 @@ fn compute_workspace_overrides(
 
     // crateName (== Cargo.toml [package].name) → drv_path. If the same name
     // appears in both the workspace and crates.io (it shouldn't), prefer the
-    // 0.0.0 version which is how cargoNix tags local crates.
+    // 0.0.0 version which is how cargo-nix-plugin tags local crates.
     let is_local = |drv: &str| {
         g.nodes[drv]
             .drv
@@ -430,7 +437,7 @@ fn cmd_clean(args: &[String]) {
     let cache = ArtifactCache::new();
 
     if args.is_empty() || args[0] == "--help" {
-        eprintln!("usage: nix-inc clean [--all | --incremental | <member-name>]");
+        eprintln!("usage: bob clean [--all | --incremental | <member-name>]");
         eprintln!();
         eprintln!("  --all           Remove all artifacts + incremental cache");
         eprintln!("  --incremental   Remove only incremental compilation cache");
@@ -466,7 +473,7 @@ fn cmd_clean(args: &[String]) {
 
     // Clean a specific member — need to find its drv path
     let member = &args[0];
-    let repo_root = find_repo_root().expect("could not find monorepo root");
+    let repo_root = find_repo_root().expect("could not find repo root");
     let eval_cache = resolve::EvalCache::new(cache.root());
 
     match eval_cache.resolve_one(&repo_root, member) {
@@ -566,7 +573,7 @@ fn cmd_parse_drv(args: &[String]) {
 
 fn cmd_graph(args: &[String]) {
     if args.is_empty() {
-        eprintln!("usage: nix-inc graph <drv-path>...");
+        eprintln!("usage: bob graph <drv-path>...");
         std::process::exit(1);
     }
 

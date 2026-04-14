@@ -100,7 +100,14 @@ impl BuildGraph {
             for _ in 0..num_deps {
                 crate_deps.push(read_string(&buf, &mut pos)?);
             }
-            nodes.insert(drv_path.clone(), CrateNode { drv_path, drv, crate_deps });
+            nodes.insert(
+                drv_path.clone(),
+                CrateNode {
+                    drv_path,
+                    drv,
+                    crate_deps,
+                },
+            );
         }
 
         let num_topo = read_u32(&buf, &mut pos)?;
@@ -123,7 +130,11 @@ impl BuildGraph {
             }
         }
 
-        Some(BuildGraph { nodes, topo_order, non_crate_input_map })
+        Some(BuildGraph {
+            nodes,
+            topo_order,
+            non_crate_input_map,
+        })
     }
 
     /// Build the graph starting from a set of root drv paths.
@@ -145,10 +156,10 @@ impl BuildGraph {
                 continue;
             }
 
-            let contents = std::fs::read(drv_file)
-                .map_err(|e| format!("reading {drv_path}: {e}"))?;
-            let drv = Derivation::parse(&contents)
-                .map_err(|e| format!("parsing {drv_path}: {e}"))?;
+            let contents =
+                std::fs::read(drv_file).map_err(|e| format!("reading {drv_path}: {e}"))?;
+            let drv =
+                Derivation::parse(&contents).map_err(|e| format!("parsing {drv_path}: {e}"))?;
 
             // Only include crate derivations (those built by buildRustCrate)
             if drv.env.get("crateName").is_none() {
@@ -162,17 +173,23 @@ impl BuildGraph {
                 queue.push_back(dep_path.clone());
             }
 
-            nodes.insert(drv_path.clone(), CrateNode {
-                drv_path: drv_path.clone(),
-                drv,
-                crate_deps: Vec::new(), // filled in second pass
-            });
+            nodes.insert(
+                drv_path.clone(),
+                CrateNode {
+                    drv_path: drv_path.clone(),
+                    drv,
+                    crate_deps: Vec::new(), // filled in second pass
+                },
+            );
         }
 
         // Second pass: fill in crate_deps (only edges to other crate nodes)
         let crate_drv_paths: HashSet<String> = nodes.keys().cloned().collect();
         for node in nodes.values_mut() {
-            node.crate_deps = node.drv.input_derivations.keys()
+            node.crate_deps = node
+                .drv
+                .input_derivations
+                .keys()
                 .filter(|p| crate_drv_paths.contains(p.as_str()))
                 .cloned()
                 .collect();
@@ -208,7 +225,11 @@ impl BuildGraph {
             }
         }
 
-        Ok(BuildGraph { nodes, topo_order, non_crate_input_map })
+        Ok(BuildGraph {
+            nodes,
+            topo_order,
+            non_crate_input_map,
+        })
     }
 
     pub fn crate_count(&self) -> usize {
@@ -249,7 +270,8 @@ impl BuildGraph {
         }
         cmd.stderr(std::process::Stdio::inherit());
 
-        let output = cmd.output()
+        let output = cmd
+            .output()
             .map_err(|e| format!("running nix-store --realise: {e}"))?;
 
         if !output.status.success() {
@@ -307,7 +329,14 @@ fn read_derivation(buf: &[u8], pos: &mut usize) -> Option<Derivation> {
         let path = read_string(buf, pos)?;
         let hash_algo = read_string(buf, pos)?;
         let hash = read_string(buf, pos)?;
-        outputs.insert(name, Output { path, hash_algo, hash });
+        outputs.insert(
+            name,
+            Output {
+                path,
+                hash_algo,
+                hash,
+            },
+        );
     }
     let num_input_drvs = read_u32(buf, pos)?;
     let mut input_derivations = BTreeMap::new();
@@ -340,8 +369,13 @@ fn read_derivation(buf: &[u8], pos: &mut usize) -> Option<Derivation> {
         env.insert(k, v);
     }
     Some(Derivation {
-        outputs, input_derivations, input_sources,
-        platform, builder, args, env,
+        outputs,
+        input_derivations,
+        input_sources,
+        platform,
+        builder,
+        args,
+        env,
     })
 }
 
@@ -356,7 +390,9 @@ fn write_bytes(buf: &mut Vec<u8>, b: &[u8]) {
 }
 
 fn read_u32(buf: &[u8], pos: &mut usize) -> Option<u32> {
-    if *pos + 4 > buf.len() { return None; }
+    if *pos + 4 > buf.len() {
+        return None;
+    }
     let v = u32::from_le_bytes(buf[*pos..*pos + 4].try_into().ok()?);
     *pos += 4;
     Some(v)
@@ -364,7 +400,9 @@ fn read_u32(buf: &[u8], pos: &mut usize) -> Option<u32> {
 
 fn read_string(buf: &[u8], pos: &mut usize) -> Option<String> {
     let len = read_u32(buf, pos)? as usize;
-    if *pos + len > buf.len() { return None; }
+    if *pos + len > buf.len() {
+        return None;
+    }
     let s = String::from_utf8(buf[*pos..*pos + len].to_vec()).ok()?;
     *pos += len;
     Some(s)
@@ -372,7 +410,9 @@ fn read_string(buf: &[u8], pos: &mut usize) -> Option<String> {
 
 fn read_raw_bytes(buf: &[u8], pos: &mut usize) -> Option<Vec<u8>> {
     let len = read_u32(buf, pos)? as usize;
-    if *pos + len > buf.len() { return None; }
+    if *pos + len > buf.len() {
+        return None;
+    }
     let b = buf[*pos..*pos + len].to_vec();
     *pos += len;
     Some(b)
@@ -404,7 +444,8 @@ fn topo_sort(nodes: &BTreeMap<String, CrateNode>) -> Result<Vec<String>, String>
     }
 
     // Kahn's: start with nodes that have no crate deps
-    let mut queue: VecDeque<&str> = in_deg.iter()
+    let mut queue: VecDeque<&str> = in_deg
+        .iter()
         .filter(|(_, &deg)| deg == 0)
         .map(|(&k, _)| k)
         .collect();
@@ -415,7 +456,10 @@ fn topo_sort(nodes: &BTreeMap<String, CrateNode>) -> Result<Vec<String>, String>
     for node in nodes.values() {
         for dep in &node.crate_deps {
             if nodes.contains_key(dep) {
-                dependents.entry(dep.as_str()).or_default().push(node.drv_path.as_str());
+                dependents
+                    .entry(dep.as_str())
+                    .or_default()
+                    .push(node.drv_path.as_str());
             }
         }
     }
@@ -458,10 +502,16 @@ mod tests {
 
         let graph = BuildGraph::from_roots(&[drv_path.to_string()]).unwrap();
         // Should have at least hello and serde
-        assert!(graph.crate_count() >= 1, "expected at least 1 crate, got {}", graph.crate_count());
+        assert!(
+            graph.crate_count() >= 1,
+            "expected at least 1 crate, got {}",
+            graph.crate_count()
+        );
 
         // Topo order should have deps before dependents
-        let positions: HashMap<&str, usize> = graph.topo_order.iter()
+        let positions: HashMap<&str, usize> = graph
+            .topo_order
+            .iter()
             .enumerate()
             .map(|(i, p)| (p.as_str(), i))
             .collect();
@@ -470,9 +520,13 @@ mod tests {
             let my_pos = positions[node.drv_path.as_str()];
             for dep in &node.crate_deps {
                 if let Some(&dep_pos) = positions.get(dep.as_str()) {
-                    assert!(dep_pos < my_pos,
+                    assert!(
+                        dep_pos < my_pos,
                         "dep {} (pos {}) should come before {} (pos {})",
-                        dep, dep_pos, node.drv_path, my_pos
+                        dep,
+                        dep_pos,
+                        node.drv_path,
+                        my_pos
                     );
                 }
             }

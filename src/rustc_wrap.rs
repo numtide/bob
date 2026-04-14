@@ -7,7 +7,7 @@
 //! this is ~single-digit ms.
 //!
 //! Invoked via a one-line shim at `tmp/<key>/rustc-wrap/rustc`:
-//!     exec /path/to/nix-inc __rustc-wrap "$@"
+//!     exec /path/to/bob __rustc-wrap "$@"
 //! Config arrives via env vars set in builder.sh after `source $stdenv/setup`
 //! (so PATH already has the real rustc). The rmeta-ready signal goes out on
 //! fd 3 (the worker's saved stdout), so the scheduler's existing
@@ -37,10 +37,10 @@ impl Cfg {
         let env = |k: &str| std::env::var(k).unwrap_or_default();
         let deps = format!("{} {}", env("completeDeps"), env("completeBuildDeps"));
         Self {
-            real_rustc: env("NIXINC_REAL_RUSTC"),
-            rmeta_dir: PathBuf::from(env("NIXINC_RMETA_DIR")),
-            expected_rmeta: env("NIXINC_EXPECTED_RMETA"),
-            skip_link_pass: !env("NIXINC_SKIP_LINK_PASS").is_empty(),
+            real_rustc: env("BOB_REAL_RUSTC"),
+            rmeta_dir: PathBuf::from(env("BOB_WRAP_RMETA_DIR")),
+            expected_rmeta: env("BOB_EXPECTED_RMETA"),
+            skip_link_pass: !env("BOB_SKIP_LINK_PASS").is_empty(),
             complete_deps: deps.split_whitespace().map(String::from).collect(),
         }
     }
@@ -143,13 +143,13 @@ fn rmeta_arg_tmp(arg: &str) -> Option<&str> {
     if !p.ends_with(".rmeta") {
         return None;
     }
-    let i = p.find("/nix-inc/tmp/")?;
-    let after = &p[i + "/nix-inc/tmp/".len()..];
+    let i = p.find("/bob/tmp/")?;
+    let after = &p[i + "/bob/tmp/".len()..];
     let key_end = after.find('/')?;
     if &after[key_end..key_end + "/rmeta/".len()] != "/rmeta/" {
         return None;
     }
-    Some(&p[..i + "/nix-inc/tmp/".len() + key_end])
+    Some(&p[..i + "/bob/tmp/".len() + key_end])
 }
 
 /// Swap each in-flight `--extern …rmeta` arg to its rlib once the dep commits.
@@ -176,11 +176,8 @@ fn swap_rmeta_args_to_rlib(args: &mut [String]) {
 /// `target/deps` left the build-script link without transitive rlibs.
 fn wait_closure_done_and_relink(cfg: &Cfg, dep_dirs: &[PathBuf]) {
     for i in &cfg.complete_deps {
-        // In-flight paths are `…/nix-inc/tmp/<k>/lib`.
-        if let Some(prefix) = i
-            .strip_suffix("/lib")
-            .filter(|p| p.contains("/nix-inc/tmp/"))
-        {
+        // In-flight paths are `…/bob/tmp/<k>/lib`.
+        if let Some(prefix) = i.strip_suffix("/lib").filter(|p| p.contains("/bob/tmp/")) {
             let done = format!("{prefix}/done");
             poll_until(|| Path::new(&done).exists());
         }
@@ -243,7 +240,7 @@ fn run_lib_with_stream(cfg: &Cfg, lib_types: &[String], args: &[String]) -> i32 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("nix-inc: spawning rustc: {e}");
+            eprintln!("bob: spawning rustc: {e}");
             return 127;
         }
     };
@@ -304,7 +301,7 @@ pub fn main(argv: &[String]) -> ! {
             .args(&c.link_types)
             .args(&c.args)
             .exec();
-        eprintln!("nix-inc: exec rustc: {err}");
+        eprintln!("bob: exec rustc: {err}");
         std::process::exit(127);
     }
 
@@ -419,8 +416,8 @@ mod tests {
 
     #[test]
     fn rmeta_tmp_extraction() {
-        let a = "syn=/root/.cache/nix-inc/tmp/abc123/rmeta/libsyn-x.rmeta";
-        assert_eq!(rmeta_arg_tmp(a), Some("/root/.cache/nix-inc/tmp/abc123"));
+        let a = "syn=/root/.cache/bob/tmp/abc123/rmeta/libsyn-x.rmeta";
+        assert_eq!(rmeta_arg_tmp(a), Some("/root/.cache/bob/tmp/abc123"));
         assert_eq!(rmeta_arg_tmp("syn=/artifacts/abc/lib/libsyn.rlib"), None);
     }
 

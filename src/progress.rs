@@ -62,10 +62,7 @@ impl Progress {
         let secs = duration.as_secs_f64();
         let stderr = std::io::stderr();
         let mut err = stderr.lock();
-        let _ = writeln!(
-            err,
-            "  {BOLD_GREEN}Built{RESET} {name} ({secs:.1}s)"
-        );
+        let _ = writeln!(err, "  {BOLD_GREEN}Built{RESET} {name} ({secs:.1}s)");
         inner.render_progress();
     }
 
@@ -81,7 +78,11 @@ impl Progress {
         let _ = writeln!(err, "  {RED}FAILED{RESET} {name}");
 
         // Show last few lines of output for context
-        let combined = if !stderr_text.is_empty() { stderr_text } else { stdout };
+        let combined = if !stderr_text.is_empty() {
+            stderr_text
+        } else {
+            stdout
+        };
         let lines: Vec<&str> = combined.lines().collect();
         let show = &lines[lines.len().saturating_sub(10)..];
         for line in show {
@@ -92,7 +93,13 @@ impl Progress {
     }
 
     /// Print the final summary line.
-    pub fn summary(&self, built: usize, cached: usize, failed: usize, duration: std::time::Duration) {
+    pub fn summary(
+        &self,
+        built: usize,
+        cached: usize,
+        failed: usize,
+        duration: std::time::Duration,
+    ) {
         let mut inner = self.inner.lock().unwrap();
         inner.clear_line();
 
@@ -116,7 +123,9 @@ impl Progress {
 
 impl ProgressInner {
     fn clear_line(&mut self) {
-        if !self.is_tty { return; }
+        if !self.is_tty {
+            return;
+        }
         let stderr = std::io::stderr();
         let mut err = stderr.lock();
         // Move to start of line and clear

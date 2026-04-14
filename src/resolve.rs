@@ -12,7 +12,13 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
-const NIX: &str = "nix-instantiate";
+/// Path to nix-instantiate. Must be a Nix that has
+/// `builtins.resolveCargoWorkspace` (cargo-nix-plugin) for the repo's
+/// `bob.nix` to evaluate. Override with `BOB_NIX_INSTANTIATE` to point at a
+/// patched build; otherwise resolved from PATH.
+fn nix_instantiate() -> String {
+    std::env::var("BOB_NIX_INSTANTIATE").unwrap_or_else(|_| "nix-instantiate".into())
+}
 
 /// Result of resolving a workspace member.
 pub struct ResolveResult {
@@ -77,7 +83,7 @@ impl EvalCache {
     /// Uses a two-level approach: first hashes mtimes (fast ~0.1ms),
     /// then only reads file contents if the mtime hash changed since
     /// last time. The mtime→content mapping is cached under
-    /// `$XDG_CACHE_HOME/nix-inc/mtime/<blake3(abs_dir)>` so we don't litter
+    /// `$XDG_CACHE_HOME/bob/mtime/<blake3(abs_dir)>` so we don't litter
     /// the worktree (this now runs on every workspace crate, not just the
     /// build target).
     pub fn source_hash(repo_root: &Path, crate_dir: &Path) -> Result<String, String> {
@@ -102,11 +108,10 @@ impl EvalCache {
         let mtime_key = mtime_hasher.finalize().to_hex()[..32].to_string();
 
         // Check if we already computed a content hash for this mtime snapshot
-        let cache_home = std::env::var("XDG_CACHE_HOME").unwrap_or_else(|_| {
-            format!("{}/.cache", std::env::var("HOME").unwrap_or_default())
-        });
+        let cache_home = std::env::var("XDG_CACHE_HOME")
+            .unwrap_or_else(|_| format!("{}/.cache", std::env::var("HOME").unwrap_or_default()));
         let mtime_cache_path = PathBuf::from(cache_home)
-            .join("nix-inc")
+            .join("bob")
             .join("mtime")
             .join(&dir_key);
         if let Ok(cached) = std::fs::read_to_string(&mtime_cache_path) {
@@ -181,21 +186,17 @@ impl EvalCache {
             }
         }
 
-        // Path 2: full nix-instantiate
+        // Path 2: full nix-instantiate against the repo's bob.nix.
+        // bob.nix must evaluate to an attrset with
+        // `workspaceMembers.<name>.build` (the cargo-nix-plugin convention).
         eprintln!(" \x1b[1;36mResolving\x1b[0m '{member}' via nix-instantiate...");
 
         let expr = format!(
-            r#"
-            let
-              pkgs = import <nixpkgs> {{}};
-              utils = import {root}/bob.nix {{ inherit pkgs; }};
-              cargoNix = utils.cargoNix {{}};
-            in cargoNix.workspaceMembers.{member}.build
-            "#,
+            "(import {root}/bob.nix {{}}).workspaceMembers.{member}.build",
             root = repo_root.display(),
         );
 
-        let output = Command::new(NIX)
+        let output = Command::new(nix_instantiate())
             .arg("--expr")
             .arg(&expr)
             .output()

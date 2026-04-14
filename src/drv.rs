@@ -70,7 +70,10 @@ impl<'a> Parser<'a> {
                 "expected {:?}, got {:?} at pos {}",
                 b as char, c as char, self.pos
             )),
-            None => Err(format!("expected {:?}, got EOF at pos {}", b as char, self.pos)),
+            None => Err(format!(
+                "expected {:?}, got EOF at pos {}",
+                b as char, self.pos
+            )),
         }
     }
 
@@ -80,7 +83,12 @@ impl<'a> Parser<'a> {
             self.advance(bytes.len());
             Ok(())
         } else {
-            let got: String = self.remaining().iter().take(s.len()).map(|&b| b as char).collect();
+            let got: String = self
+                .remaining()
+                .iter()
+                .take(s.len())
+                .map(|&b| b as char)
+                .collect();
             Err(format!("expected {s:?}, got {got:?} at pos {}", self.pos))
         }
     }
@@ -104,7 +112,12 @@ impl<'a> Parser<'a> {
                         Some(b'n') => result.push('\n'),
                         Some(b'r') => result.push('\r'),
                         Some(b't') => result.push('\t'),
-                        Some(c) => return Err(format!("unknown escape \\{} at pos {}", c as char, self.pos)),
+                        Some(c) => {
+                            return Err(format!(
+                                "unknown escape \\{} at pos {}",
+                                c as char, self.pos
+                            ))
+                        }
                         None => return Err("unterminated escape".into()),
                     }
                     self.advance(1);
@@ -118,7 +131,10 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse `[elem, elem, ...]` where elem is parsed by `f`.
-    fn parse_list<T>(&mut self, f: impl Fn(&mut Self) -> Result<T, String>) -> Result<Vec<T>, String> {
+    fn parse_list<T>(
+        &mut self,
+        f: impl Fn(&mut Self) -> Result<T, String>,
+    ) -> Result<Vec<T>, String> {
         self.expect_byte(b'[')?;
         let mut items = Vec::new();
         if self.peek() == Some(b']') {
@@ -133,7 +149,12 @@ impl<'a> Parser<'a> {
                     self.advance(1);
                     return Ok(items);
                 }
-                Some(c) => return Err(format!("expected ',' or ']', got {:?} at pos {}", c as char, self.pos)),
+                Some(c) => {
+                    return Err(format!(
+                        "expected ',' or ']', got {:?} at pos {}",
+                        c as char, self.pos
+                    ))
+                }
                 None => return Err("unterminated list".into()),
             }
         }
@@ -156,7 +177,14 @@ impl Derivation {
             p.expect_byte(b',')?;
             let hash = p.parse_string()?;
             p.expect_byte(b')')?;
-            Ok((name, Output { path, hash_algo, hash }))
+            Ok((
+                name,
+                Output {
+                    path,
+                    hash_algo,
+                    hash,
+                },
+            ))
         })?;
         let outputs: BTreeMap<_, _> = output_tuples.into_iter().collect();
 
@@ -209,7 +237,7 @@ impl Derivation {
         p.expect_byte(b')')?;
 
         // With __structuredAttrs, individual env vars are packed into a
-        // single __json blob. Unpack them so the rest of nix-inc can
+        // single __json blob. Unpack them so the rest of bob can
         // access fields uniformly via env.get("crateName") etc.
         let env = Self::unpack_structured_attrs(env);
 
@@ -264,9 +292,7 @@ impl Derivation {
                         env.insert(k, String::new());
                     }
                     // String lists: join with spaces (matches bash env var format)
-                    serde_json::Value::Array(ref arr)
-                        if arr.iter().all(|v| v.is_string()) =>
-                    {
+                    serde_json::Value::Array(ref arr) if arr.iter().all(|v| v.is_string()) => {
                         let joined = arr
                             .iter()
                             .filter_map(|v| v.as_str())
@@ -345,7 +371,9 @@ mod tests {
 
         // Should have serde as a dependency
         assert!(
-            drv.env.get("completeDeps").is_some_and(|v| v.contains("serde")),
+            drv.env
+                .get("completeDeps")
+                .is_some_and(|v| v.contains("serde")),
             "expected completeDeps to reference serde"
         );
         // buildPhase should have --extern serde=...

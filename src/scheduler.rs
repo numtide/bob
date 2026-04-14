@@ -53,9 +53,7 @@ fn is_pipelineable(drv: &Derivation) -> bool {
     // crateType is space-separated; "lib cdylib" / "rlib" both produce a
     // usable rmeta (the cdylib half needs upstream rlibs, but that's handled
     // by the wrapper's poll-for-done on the IN side). proc-macro never does.
-    let emits_lib = ct
-        .split_whitespace()
-        .any(|t| t == "lib" || t == "rlib");
+    let emits_lib = ct.split_whitespace().any(|t| t == "lib" || t == "rlib");
     emits_lib && !has_links
 }
 
@@ -370,8 +368,7 @@ fn worker_loop(
             // hardlink-copies tmp→artifacts and leaves tmp/ intact for the
             // remainder of the run.
             for (name, out) in &node.drv.outputs {
-                s.output_map
-                    .insert(out.path.clone(), my_tmp.join(name));
+                s.output_map.insert(out.path.clone(), my_tmp.join(name));
             }
             s.in_flight_tmp.insert(drv_path.clone(), my_tmp.clone());
 

@@ -105,7 +105,8 @@ done
 
         // Wait for READY
         let mut line = String::new();
-        reader.read_line(&mut line)
+        reader
+            .read_line(&mut line)
             .map_err(|e| format!("reading worker ready: {e}"))?;
         if !line.contains("__READY__") {
             return Err(format!("worker didn't signal ready, got: {line}"));
@@ -133,15 +134,19 @@ done
         std::fs::write(&stdout_file, b"").map_err(|e| format!("creating stdout file: {e}"))?;
         std::fs::write(&stderr_file, b"").map_err(|e| format!("creating stderr file: {e}"))?;
 
-        let stdin = self.child.stdin.as_mut()
-            .ok_or("worker stdin closed")?;
+        let stdin = self.child.stdin.as_mut().ok_or("worker stdin closed")?;
 
-        writeln!(stdin, "{} {} {}",
+        writeln!(
+            stdin,
+            "{} {} {}",
             script_path.display(),
             stdout_file.display(),
             stderr_file.display(),
-        ).map_err(|e| format!("writing to worker: {e}"))?;
-        stdin.flush().map_err(|e| format!("flushing worker stdin: {e}"))?;
+        )
+        .map_err(|e| format!("writing to worker: {e}"))?;
+        stdin
+            .flush()
+            .map_err(|e| format!("flushing worker stdin: {e}"))?;
 
         let mut rmeta_dir = None;
         let mut callback = Some(on_meta_ready);
@@ -149,7 +154,8 @@ done
         // Read lines until __DONE__, handling intermediate signals
         loop {
             let mut line = String::new();
-            self.reader.read_line(&mut line)
+            self.reader
+                .read_line(&mut line)
                 .map_err(|e| format!("reading worker result: {e}"))?;
 
             if let Some(dir_str) = line.strip_prefix("__META_READY__ ") {
@@ -165,7 +171,12 @@ done
                 let exit_code = code_str.trim().parse::<i32>().unwrap_or(-1);
                 let stdout = std::fs::read_to_string(&stdout_file).unwrap_or_default();
                 let stderr = std::fs::read_to_string(&stderr_file).unwrap_or_default();
-                return Ok(WorkerBuildResult { exit_code, stdout, stderr, rmeta_dir });
+                return Ok(WorkerBuildResult {
+                    exit_code,
+                    stdout,
+                    stderr,
+                    rmeta_dir,
+                });
             }
 
             if line.is_empty() {
@@ -177,7 +188,11 @@ done
     }
 
     /// Simple execute without mid-build signaling (backward compatible).
-    pub fn execute(&mut self, script_path: &Path, tmp_dir: &Path) -> Result<WorkerBuildResult, String> {
+    pub fn execute(
+        &mut self,
+        script_path: &Path,
+        tmp_dir: &Path,
+    ) -> Result<WorkerBuildResult, String> {
         self.execute_with_signal(script_path, tmp_dir, |_| {})
     }
 

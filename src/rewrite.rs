@@ -15,7 +15,9 @@ pub struct PathRewriter {
 
 impl PathRewriter {
     pub fn new() -> Self {
-        Self { rewrites: Vec::new() }
+        Self {
+            rewrites: Vec::new(),
+        }
     }
 
     /// Register a path substitution.
@@ -76,10 +78,7 @@ mod tests {
     #[test]
     fn rewrite_env_map() {
         let mut rw = PathRewriter::new();
-        rw.add(
-            "/nix/store/xxxx-out".into(),
-            "/tmp/cache/out".into(),
-        );
+        rw.add("/nix/store/xxxx-out".into(), "/tmp/cache/out".into());
 
         let mut env = BTreeMap::new();
         env.insert("out".into(), "/nix/store/xxxx-out".into());
