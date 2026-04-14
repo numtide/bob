@@ -312,16 +312,6 @@ impl Derivation {
         env.insert("__structured_attrs_unpacked".into(), "1".into());
         env
     }
-
-    /// Returns the store paths of all outputs.
-    pub fn output_paths(&self) -> Vec<&str> {
-        self.outputs.values().map(|o| o.path.as_str()).collect()
-    }
-
-    /// Returns the value of an env var, if present.
-    pub fn env_var(&self, key: &str) -> Option<&str> {
-        self.env.get(key).map(|s| s.as_str())
-    }
 }
 
 #[cfg(test)]

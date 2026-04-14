@@ -23,7 +23,6 @@ pub struct Progress {
 struct ProgressInner {
     total: usize,
     completed: usize,
-    cached_total: usize,
     active: Vec<String>,
     is_tty: bool,
     /// Width of the last progress line (for clearing).
@@ -37,7 +36,6 @@ impl Progress {
             inner: Mutex::new(ProgressInner {
                 total: to_build + cached,
                 completed: cached,
-                cached_total: cached,
                 active: Vec::new(),
                 is_tty,
                 last_line_len: 0,

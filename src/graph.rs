@@ -2,7 +2,7 @@
 //! topologically sort, and identify which crates need (re)building.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use crate::drv::Derivation;
@@ -162,7 +162,7 @@ impl BuildGraph {
                 Derivation::parse(&contents).map_err(|e| format!("parsing {drv_path}: {e}"))?;
 
             // Only include crate derivations (those built by buildRustCrate)
-            if drv.env.get("crateName").is_none() {
+            if !drv.env.contains_key("crateName") {
                 continue;
             }
 
@@ -384,11 +384,6 @@ fn write_str(buf: &mut Vec<u8>, s: &str) {
     buf.extend_from_slice(s.as_bytes());
 }
 
-fn write_bytes(buf: &mut Vec<u8>, b: &[u8]) {
-    buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
-    buf.extend_from_slice(b);
-}
-
 fn read_u32(buf: &[u8], pos: &mut usize) -> Option<u32> {
     if *pos + 4 > buf.len() {
         return None;
@@ -408,32 +403,8 @@ fn read_string(buf: &[u8], pos: &mut usize) -> Option<String> {
     Some(s)
 }
 
-fn read_raw_bytes(buf: &[u8], pos: &mut usize) -> Option<Vec<u8>> {
-    let len = read_u32(buf, pos)? as usize;
-    if *pos + len > buf.len() {
-        return None;
-    }
-    let b = buf[*pos..*pos + len].to_vec();
-    *pos += len;
-    Some(b)
-}
-
 /// Kahn's algorithm for topological sort.
 fn topo_sort(nodes: &BTreeMap<String, CrateNode>) -> Result<Vec<String>, String> {
-    let mut in_degree: HashMap<&str, usize> = HashMap::new();
-    for key in nodes.keys() {
-        in_degree.entry(key.as_str()).or_insert(0);
-    }
-    for node in nodes.values() {
-        for dep in &node.crate_deps {
-            if let Some(deg) = in_degree.get_mut(dep.as_str()) {
-                *deg += 0; // ensure entry exists
-            }
-            *in_degree.entry(node.drv_path.as_str()).or_insert(0) += 0;
-        }
-    }
-
-    // Count actual in-degrees
     let mut in_deg: HashMap<&str, usize> = nodes.keys().map(|k| (k.as_str(), 0usize)).collect();
     for node in nodes.values() {
         for dep in &node.crate_deps {

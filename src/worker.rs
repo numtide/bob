@@ -22,19 +22,17 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
-/// A persistent bash process with stdenv sourced.
-pub struct Worker {
-    child: Child,
-    reader: BufReader<std::process::ChildStdout>,
-}
-
 /// Result of a single build executed by a worker.
 pub struct WorkerBuildResult {
     pub exit_code: i32,
     pub stdout: String,
     pub stderr: String,
-    /// If the build signaled metadata readiness mid-build, the rmeta dir.
-    pub rmeta_dir: Option<PathBuf>,
+}
+
+/// A persistent bash process with stdenv sourced.
+pub struct Worker {
+    child: Child,
+    reader: BufReader<std::process::ChildStdout>,
 }
 
 impl Worker {
@@ -148,7 +146,6 @@ done
             .flush()
             .map_err(|e| format!("flushing worker stdin: {e}"))?;
 
-        let mut rmeta_dir = None;
         let mut callback = Some(on_meta_ready);
 
         // Read lines until __DONE__, handling intermediate signals
@@ -159,10 +156,8 @@ done
                 .map_err(|e| format!("reading worker result: {e}"))?;
 
             if let Some(dir_str) = line.strip_prefix("__META_READY__ ") {
-                let dir = PathBuf::from(dir_str.trim());
-                rmeta_dir = Some(dir.clone());
                 if let Some(cb) = callback.take() {
-                    cb(dir);
+                    cb(PathBuf::from(dir_str.trim()));
                 }
                 continue;
             }
@@ -175,7 +170,6 @@ done
                     exit_code,
                     stdout,
                     stderr,
-                    rmeta_dir,
                 });
             }
 
@@ -185,20 +179,6 @@ done
 
             // Unknown line — ignore (could be stray output)
         }
-    }
-
-    /// Simple execute without mid-build signaling (backward compatible).
-    pub fn execute(
-        &mut self,
-        script_path: &Path,
-        tmp_dir: &Path,
-    ) -> Result<WorkerBuildResult, String> {
-        self.execute_with_signal(script_path, tmp_dir, |_| {})
-    }
-
-    /// Check if the worker process is still alive.
-    pub fn is_alive(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(None))
     }
 }
 

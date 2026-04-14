@@ -27,6 +27,7 @@ impl ArtifactCache {
         }
     }
 
+    #[cfg(test)]
     pub fn from_path(root: PathBuf) -> Self {
         Self { root }
     }
@@ -58,63 +59,9 @@ impl ArtifactCache {
         self.root.join("artifacts").join(key)
     }
 
-    /// The "out" output directory for a cached build.
-    pub fn out_dir(&self, drv_path: &str) -> PathBuf {
-        self.artifact_dir(drv_path).join("out")
-    }
-
-    /// The "lib" output directory for a cached build.
-    pub fn lib_dir(&self, drv_path: &str) -> PathBuf {
-        self.artifact_dir(drv_path).join("lib")
-    }
-
-    /// Temp directory for in-progress builds.
-    pub fn tmp_dir(&self, drv_path: &str) -> PathBuf {
-        self.root.join("tmp").join(Self::cache_key(drv_path))
-    }
-
-    /// Check if a build result is cached.
-    pub fn is_cached(&self, drv_path: &str) -> bool {
-        self.artifact_dir(drv_path).exists()
-    }
-
     /// Check if a build result is cached, by raw key.
     pub fn is_cached_key(&self, key: &str) -> bool {
         self.artifact_dir_by_key(key).exists()
-    }
-
-    /// Atomically commit a completed build from tmp to artifacts.
-    pub fn commit(&self, drv_path: &str) -> Result<(), std::io::Error> {
-        self.commit_key(&Self::cache_key(drv_path))
-    }
-
-    /// Atomically commit by raw key.
-    pub fn commit_key(&self, key: &str) -> Result<(), std::io::Error> {
-        let tmp = self.root.join("tmp").join(key);
-        let dest = self.artifact_dir_by_key(key);
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::rename(&tmp, &dest)
-    }
-
-    /// Remove cached artifact.
-    pub fn invalidate(&self, drv_path: &str) -> Result<(), std::io::Error> {
-        let dir = self.artifact_dir(drv_path);
-        if dir.exists() {
-            std::fs::remove_dir_all(&dir)?;
-        }
-        Ok(())
-    }
-
-    /// Prepare a fresh tmp directory for building.
-    pub fn prepare_tmp(&self, drv_path: &str) -> Result<PathBuf, std::io::Error> {
-        let tmp = self.tmp_dir(drv_path);
-        if tmp.exists() {
-            std::fs::remove_dir_all(&tmp)?;
-        }
-        std::fs::create_dir_all(&tmp)?;
-        Ok(tmp)
     }
 
     pub fn root(&self) -> &Path {
@@ -137,35 +84,24 @@ mod tests {
     use super::*;
     use std::fs;
 
-    #[test]
-    fn cache_lifecycle() {
-        let tmp = tempdir();
-        let cache = ArtifactCache::from_path(tmp.clone());
-        let drv = "/nix/store/aaaa-test.drv";
-
-        assert!(!cache.is_cached(drv));
-
-        // Prepare tmp, write something, commit
-        let build_dir = cache.prepare_tmp(drv).unwrap();
-        fs::create_dir_all(build_dir.join("out")).unwrap();
-        fs::write(build_dir.join("out").join("hello"), b"world").unwrap();
-
-        cache.commit(drv).unwrap();
-        assert!(cache.is_cached(drv));
-        assert_eq!(
-            fs::read_to_string(cache.out_dir(drv).join("hello")).unwrap(),
-            "world"
-        );
-
-        // Invalidate
-        cache.invalidate(drv).unwrap();
-        assert!(!cache.is_cached(drv));
-    }
-
     fn tempdir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("nib-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("bob-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn cache_key_stable() {
+        let cache = ArtifactCache::from_path(tempdir());
+        let drv = "/nix/store/aaaa-test.drv";
+        let k = ArtifactCache::cache_key(drv);
+        assert_eq!(k.len(), 64);
+        assert!(!cache.is_cached_key(&k));
+        assert_eq!(cache.artifact_dir(drv), cache.artifact_dir_by_key(&k));
+        assert_ne!(
+            ArtifactCache::cache_key_with_source(drv, "a"),
+            ArtifactCache::cache_key_with_source(drv, "b"),
+        );
     }
 }

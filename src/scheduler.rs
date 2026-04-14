@@ -67,10 +67,7 @@ fn lib_filename(drv: &Derivation, ext: &str) -> Option<String> {
 }
 
 pub struct SchedulerResult {
-    pub succeeded: usize,
-    pub cached: usize,
     pub failed: usize,
-    pub total_duration: std::time::Duration,
 }
 
 struct SharedState {
@@ -99,7 +96,6 @@ struct SharedState {
     failed: usize,
     abort: bool,
     in_flight: usize,
-    total: usize,
 }
 
 impl SharedState {
@@ -255,12 +251,7 @@ pub fn run_parallel(
 
     if to_build == 0 {
         progress.summary(0, cached, 0, start.elapsed());
-        return SchedulerResult {
-            succeeded: 0,
-            cached,
-            failed: 0,
-            total_duration: start.elapsed(),
-        };
+        return SchedulerResult { failed: 0 };
     }
 
     let state = Arc::new((
@@ -278,7 +269,6 @@ pub fn run_parallel(
             failed: 0,
             abort: false,
             in_flight: 0,
-            total: to_build,
         }),
         Condvar::new(),
     ));
@@ -312,12 +302,7 @@ pub fn run_parallel(
 
     progress.summary(s.succeeded, cached + s.cached, s.failed, start.elapsed());
 
-    SchedulerResult {
-        succeeded: s.succeeded,
-        cached: cached + s.cached,
-        failed: s.failed,
-        total_duration: start.elapsed(),
-    }
+    SchedulerResult { failed: s.failed }
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -41,10 +41,6 @@ impl PathRewriter {
             .map(|(k, v)| (k.clone(), self.rewrite(v)))
             .collect()
     }
-
-    pub fn rewrite_count(&self) -> usize {
-        self.rewrites.len()
-    }
 }
 
 #[cfg(test)]

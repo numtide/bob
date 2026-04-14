@@ -154,20 +154,6 @@ fn resolve_target(
     eval_cache.resolve_one(repo_root, &member)
 }
 
-/// Find binaries in the root crate's artifact dir.
-fn find_output_binaries(cache: &ArtifactCache, drv_path: &str) -> Vec<PathBuf> {
-    let out_bin = cache.artifact_dir(drv_path).join("out").join("bin");
-    let mut bins = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&out_bin) {
-        for entry in entries.flatten() {
-            if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                bins.push(entry.path());
-            }
-        }
-    }
-    bins
-}
-
 fn cmd_build(args: &[String]) {
     if args.is_empty() {
         eprintln!("usage: bob build [-j N] [--repo-root <path>] <target>...");
@@ -319,7 +305,7 @@ fn cmd_build(args: &[String]) {
 ///
 ///  1. Hashing each workspace crate's source dir (mtime fast-path, ~0.1ms each).
 ///  2. Computing an *effective hash* per crate in topo order:
-///       eff(c) = blake3( own_src_hash(c) ‖ sorted(eff(d) for d in crate_deps(c)) )
+///     `eff(c) = blake3( own_src_hash(c) ‖ sorted(eff(d) for d in crate_deps(c)) )`.
 ///     Only crates that are workspace members, or depend (transitively) on one,
 ///     get an entry. Crates.io deps are leaves w.r.t. workspace crates, so they
 ///     stay on the plain `blake3(drv_path)` key and remain seedable from the
