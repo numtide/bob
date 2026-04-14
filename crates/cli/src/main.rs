@@ -3,7 +3,18 @@ use std::path::PathBuf;
 
 use bob_core::{drv, graph, overrides, resolve, scheduler, ArtifactCache, Backend};
 
-static BACKEND: bob_rust::RustBackend = bob_rust::RustBackend;
+/// Registered language backends, tried in order for `resolve_attr` /
+/// `detect_from_cwd` / `dispatch_internal`. `is_unit` and
+/// `workspace_unit_hashes` are unioned across all of them.
+///
+/// `scheduler::run_parallel` still takes a single backend (the one that
+/// resolved the root target); per-node backend dispatch in mixed-language
+/// graphs is a follow-up once a second backend exists to test against.
+static BACKENDS: &[&(dyn Backend + Sync)] = &[&bob_rust::RustBackend];
+
+fn backend() -> &'static (dyn Backend + Sync) {
+    BACKENDS[0]
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -16,8 +27,10 @@ fn main() {
         // Internal wrapper-shim re-entries (`bob __<backend>-wrap …`).
         // Dispatched first — hot path, invoked once per compiler call.
         cmd if cmd.starts_with("__") => {
-            if BACKEND.dispatch_internal(cmd, &args[2..]) {
-                unreachable!("dispatch_internal must exit when it returns true");
+            for b in BACKENDS {
+                if b.dispatch_internal(cmd, &args[2..]) {
+                    unreachable!("dispatch_internal must exit when it returns true");
+                }
             }
             eprintln!("unknown internal command: {cmd}");
             std::process::exit(1);
@@ -94,20 +107,26 @@ fn resolve_target(
     }
 
     let name = if target == "." {
-        BACKEND
-            .detect_from_cwd()
+        BACKENDS
+            .iter()
+            .find_map(|b| b.detect_from_cwd())
             .ok_or("could not detect target from current directory")?
     } else {
         target.to_string()
     };
 
-    let attr = BACKEND
-        .resolve_attr(&name, repo_root)
+    let (b, attr) = BACKENDS
+        .iter()
+        .find_map(|b| b.resolve_attr(&name, repo_root).map(|a| (*b, a)))
         .ok_or_else(|| format!("unknown target '{name}'"))?;
-    let lock_hash = BACKEND.lock_hash(repo_root)?;
+    let lock_hash = b.lock_hash(repo_root)?;
 
     let eval_cache = resolve::EvalCache::new(cache.root());
     eval_cache.resolve_one(repo_root, &name, &attr, &lock_hash)
+}
+
+fn is_unit(d: &bob_core::Derivation) -> bool {
+    BACKENDS.iter().any(|b| b.is_unit(d))
 }
 
 fn cmd_build(args: &[String]) {
@@ -161,16 +180,20 @@ fn cmd_build(args: &[String]) {
     }
 
     let drv_paths: Vec<String> = resolve_results.iter().map(|r| r.drv_path.clone()).collect();
-    let g = graph::BuildGraph::from_roots_cached(&drv_paths, cache.root(), |d| BACKEND.is_unit(d))
+    let g = graph::BuildGraph::from_roots_cached(&drv_paths, cache.root(), is_unit)
         .expect("building graph");
 
     // Realize any missing source tarballs / build inputs
     g.realize_inputs().expect("realizing inputs");
 
     // Per-unit source overrides with cascading invalidation; see
-    // overrides::cascade for the algorithm. The backend supplies
-    // own-source hashes for its workspace units.
-    let overrides = overrides::cascade(&g, BACKEND.workspace_unit_hashes(&repo_root, &g));
+    // overrides::cascade for the algorithm. Each backend supplies own-source
+    // hashes for the workspace units it recognises.
+    let mut own = std::collections::HashMap::new();
+    for b in BACKENDS {
+        own.extend(b.workspace_unit_hashes(&repo_root, &g));
+    }
+    let overrides = overrides::cascade(&g, own);
 
     if dump_keys {
         for (drv, node) in &g.nodes {
@@ -178,7 +201,7 @@ fn cmd_build(args: &[String]) {
                 Some(ov) => ArtifactCache::cache_key_with_source(drv, &ov.source_hash),
                 None => ArtifactCache::cache_key(drv),
             };
-            println!("{key} {} {drv}", BACKEND.unit_name(&node.drv));
+            println!("{key} {} {drv}", backend().unit_name(&node.drv));
         }
         return;
     }
@@ -189,7 +212,7 @@ fn cmd_build(args: &[String]) {
         jobs
     );
 
-    let result = scheduler::run_parallel(&g, &cache, jobs, &BACKEND, &overrides, &drv_paths);
+    let result = scheduler::run_parallel(&g, &cache, jobs, backend(), &overrides, &drv_paths);
 
     // Show output binaries for root crates
     for r in &resolve_results {
@@ -374,13 +397,13 @@ fn cmd_graph(args: &[String]) {
     }
 
     let roots: Vec<String> = args.to_vec();
-    match graph::BuildGraph::from_roots(&roots, |d| BACKEND.is_unit(d)) {
+    match graph::BuildGraph::from_roots(&roots, is_unit) {
         Ok(g) => {
             println!("units in graph: {}", g.unit_count());
             println!("topological order:");
             for (i, drv_path) in g.topo_order.iter().enumerate() {
                 let node = &g.nodes[drv_path];
-                let name = BACKEND.unit_name(&node.drv);
+                let name = backend().unit_name(&node.drv);
                 let ndeps = node.unit_deps.len();
                 println!("  {i:3}. {name} ({ndeps} deps)");
             }
