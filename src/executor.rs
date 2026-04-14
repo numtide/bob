@@ -32,11 +32,6 @@ pub struct PipelineConfig {
     /// read the rlib), so linking it just burns CPU on every iteration. Root
     /// targets always link — the `.so` IS the product (pyo3 modules).
     pub skip_link_pass: bool,
-    /// Additional `(from, to)` rewrites applied AFTER the standard prefix
-    /// rewrites — swaps each in-flight dep's `<dep_tmp>/lib/lib/<f>.rlib` (the
-    /// path that ends up in LIB_RUSTC_OPTS after prefix rewriting) to the
-    /// dep's immutable early-published `<dep_tmp>/rmeta/<f>.rmeta`.
-    pub rmeta_rewrites: Vec<(String, String)>,
 }
 
 /// Override for a crate's cache key (and optionally its source) when reusing
@@ -108,18 +103,6 @@ pub fn build_crate_with_worker_signaled(
     let tmp = cache.root().join("tmp").join(&effective_key);
     std::fs::create_dir_all(tmp.join("lib").join("lib"))
         .map_err(|e| format!("creating tmp dir: {e}"))?;
-    // Swap in-flight deps' .rlib paths for their early-written .rmeta. Applied
-    // AFTER store-prefix rewrites so they match the already-rewritten cache/tmp
-    // paths. Transitive in-flight deps under `-L dependency=target/deps` are
-    // handled later by rustc_wrap::wait_closure_done_and_relink, which polls
-    // each dep's `done` marker and re-symlinks rlibs into target/deps.
-    let apply_rmeta_rewrites = |s: &mut String| {
-        for (from, to) in &pl.rmeta_rewrites {
-            if s.contains(from) {
-                *s = s.replace(from, to);
-            }
-        }
-    };
 
     let out_dir = tmp.join("out");
     let lib_dir = tmp.join("lib");
@@ -138,14 +121,13 @@ pub fn build_crate_with_worker_signaled(
             .env
             .get("__json")
             .ok_or("structuredAttrs drv missing __json")?;
-        let mut rewritten_json = rewrite_structured_attrs_json(
+        let rewritten_json = rewrite_structured_attrs_json(
             json_str,
             out_dir.to_str().unwrap(),
             lib_dir.to_str().unwrap(),
             rewriter,
             src_override.and_then(|ov| ov.src_path.as_deref()),
         );
-        apply_rmeta_rewrites(&mut rewritten_json);
         let json_val: serde_json::Value =
             serde_json::from_str(&rewritten_json).map_err(|e| format!("parsing __json: {e}"))?;
         let attrs_sh = json_to_attrs_sh(&json_val);
@@ -168,10 +150,7 @@ pub fn build_crate_with_worker_signaled(
     } else {
         // Non-structured drv: export every env var verbatim. $'...' quoting
         // (3ms for ~80 vars) avoids the per-var heredoc fork (200ms).
-        let mut env = rewriter.rewrite_env(&drv.env);
-        for v in env.values_mut() {
-            apply_rmeta_rewrites(v);
-        }
+        let env = rewriter.rewrite_env(&drv.env);
         let env_file = tmp.join("env.sh");
         let mut ef = String::new();
         for (k, v) in &env {

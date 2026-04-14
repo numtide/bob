@@ -84,9 +84,6 @@ struct SharedState {
     /// front, and for in-flight crates as soon as they START (pointing at
     /// tmp/<key>/lib so downstream can read the early rmeta).
     output_map: BTreeMap<String, PathBuf>,
-    /// drv_path → effective tmp dir, so dependents can build .rlib→.rmeta
-    /// rewrites for in-flight deps.
-    in_flight_tmp: HashMap<String, PathBuf>,
     /// drv_paths whose rmeta has been signalled. The fd-3 signal and the
     /// post-success catch-up both call `fire_rmeta`; this set guarantees
     /// idempotence so dependents are decremented exactly once.
@@ -262,7 +259,6 @@ pub fn run_parallel(
             rmeta_dependents,
             done_dependents,
             output_map,
-            in_flight_tmp: HashMap::new(),
             rmeta_fired: HashSet::new(),
             succeeded: 0,
             cached: 0,
@@ -277,7 +273,6 @@ pub fn run_parallel(
         for _ in 0..jobs {
             let state = Arc::clone(&state);
             let progress = Arc::clone(&progress);
-            let pipelineable = &pipelineable;
             let tmp_dir = &tmp_dir;
             let roots = &roots;
             s.spawn(move || {
@@ -290,7 +285,6 @@ pub fn run_parallel(
                     &mut worker,
                     &progress,
                     overrides,
-                    pipelineable,
                     tmp_dir,
                     roots,
                 );
@@ -313,14 +307,13 @@ fn worker_loop(
     worker: &mut crate::worker::Worker,
     progress: &Progress,
     overrides: &HashMap<String, SourceOverride>,
-    pipelineable: &HashMap<String, bool>,
     tmp_dir: &dyn Fn(&str) -> PathBuf,
     roots: &HashSet<&str>,
 ) {
     let (lock, cvar) = state;
 
     loop {
-        let (drv_path, dep_map, rmeta_rewrites) = {
+        let (drv_path, dep_map) = {
             let mut s = lock.lock().unwrap();
 
             while s.ready.is_empty() && !s.all_done() {
@@ -355,15 +348,13 @@ fn worker_loop(
             for (name, out) in &node.drv.outputs {
                 s.output_map.insert(out.path.clone(), my_tmp.join(name));
             }
-            s.in_flight_tmp.insert(drv_path.clone(), my_tmp.clone());
 
             // Build dep_map (store-path → cache-or-tmp path) for direct deps.
-            // Transitives are resolved via paths embedded in each dep's
-            // metadata (rustc records where it found upstream crates), so as
-            // long as those tmp/ paths stay valid (we leave a tmp→artifacts
-            // symlink on commit), no extra rewriting is needed.
+            // In-flight deps' --extern resolution and transitive lookup are
+            // handled at rustc time by rustc_wrap::resolve_lib_deps, which
+            // symlinks each in-flight dep's early rmeta into target/deps and
+            // re-resolves missing externs by metadata hash.
             let mut dep_map: BTreeMap<String, PathBuf> = BTreeMap::new();
-            let mut rmeta_rewrites: Vec<(String, String)> = Vec::new();
             for dep_drv in &node.crate_deps {
                 let Some(dep_node) = nodes.get(dep_drv) else {
                     continue;
@@ -373,35 +364,9 @@ fn worker_loop(
                         dep_map.insert(out.path.clone(), cache_path.clone());
                     }
                 }
-                // In-flight pipelineable dep: its lib/lib/ only has the rmeta
-                // so far. Swap the .rlib reference (post-prefix-rewrite) to
-                // .rmeta so rustc reads the fat metadata.
-                if let Some(dep_tmp) = s.in_flight_tmp.get(dep_drv) {
-                    if *pipelineable.get(dep_drv).unwrap_or(&false) {
-                        if let Some(rlib) = lib_filename(&dep_node.drv, "rlib") {
-                            let rmeta = lib_filename(&dep_node.drv, "rmeta").unwrap();
-                            // After prefix rewriting the --extern arg is
-                            // `<dep_tmp>/lib/lib/<rlib>`; redirect it to the
-                            // immutable early-published `<dep_tmp>/rmeta/<rmeta>`.
-                            rmeta_rewrites.push((
-                                dep_tmp
-                                    .join("lib")
-                                    .join("lib")
-                                    .join(&rlib)
-                                    .to_string_lossy()
-                                    .into_owned(),
-                                dep_tmp
-                                    .join("rmeta")
-                                    .join(&rmeta)
-                                    .to_string_lossy()
-                                    .into_owned(),
-                            ));
-                        }
-                    }
-                }
             }
 
-            (drv_path, dep_map, rmeta_rewrites)
+            (drv_path, dep_map)
         };
 
         let node = &nodes[&drv_path];
@@ -421,7 +386,6 @@ fn worker_loop(
             // Only the explicit build targets need their cdylib/staticlib
             // output; for transitive deps the rlib is all anyone reads.
             skip_link_pass: !roots.contains(drv_path.as_str()),
-            rmeta_rewrites,
         };
         let result = executor::build_crate_with_worker_signaled(
             &drv_path,
@@ -441,7 +405,6 @@ fn worker_loop(
         {
             let mut s = lock.lock().unwrap();
             s.in_flight -= 1;
-            s.in_flight_tmp.remove(&drv_path);
 
             match result {
                 Ok(ref r) if r.success => {
