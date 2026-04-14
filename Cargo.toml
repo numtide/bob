@@ -3,6 +3,7 @@ name = "bob"
 description = "Bob the Builder — fast incremental builds on top of Nix"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 repository = "https://github.com/numtide/bob"
 
 [workspace]
