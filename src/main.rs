@@ -189,31 +189,13 @@ fn cmd_build(args: &[String]) {
         return;
     }
 
-    // Find bash and stdenv from the first crate drv
-    let first_drv = g.nodes.values().next().expect("empty graph");
-    let bash = first_drv.drv.builder.clone();
-    let stdenv_path = first_drv
-        .drv
-        .env
-        .get("stdenv")
-        .expect("drv missing stdenv")
-        .clone();
-
     eprintln!(
-        "\x1b[1m  Compiling\x1b[0m {} crates ({} jobs)",
+        "\x1b[1m  Compiling\x1b[0m {} units ({} jobs)",
         g.unit_count(),
         jobs
     );
 
-    let result = scheduler::run_parallel(
-        &g,
-        &cache,
-        jobs,
-        &bash,
-        &stdenv_path,
-        &overrides,
-        &drv_paths,
-    );
+    let result = scheduler::run_parallel(&g, &cache, jobs, &BACKEND, &overrides, &drv_paths);
 
     // Show output binaries for root crates
     for r in &resolve_results {

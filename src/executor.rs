@@ -15,28 +15,10 @@ use crate::attrs::{
     escape_for_dollar_single_quote, is_valid_bash_ident, json_to_attrs_sh,
     rewrite_structured_attrs_json,
 };
+use crate::backend::{Backend, BuildContext};
 use crate::cache::ArtifactCache;
 use crate::drv::Derivation;
 use crate::rewrite::PathRewriter;
-
-/// Per-crate pipelining configuration.
-///
-/// When set, the build wraps `rustc` to emit `metadata,link` and signal
-/// `__META_READY__` on fd 3 as soon as the fat rmeta (with MIR) is written.
-/// The scheduler dispatches that to start dependents before this crate's
-/// codegen finishes (cargo-style pipelining).
-pub struct PipelineConfig {
-    /// Basename of THIS crate's rmeta (`lib{libName}-{metadata}.rmeta`). The
-    /// wrapper only signals when rustc emits exactly this artifact — build
-    /// scripts that probe rustc (`--emit=metadata probe.rs`) emit other rmetas
-    /// that must not fire dependents.
-    pub expected_rmeta: String,
-    /// Skip the cdylib/staticlib second pass. Set for non-root crates: nothing
-    /// in the dependency path consumes the `.so` (downstream Rust crates only
-    /// read the rlib), so linking it just burns CPU on every iteration. Root
-    /// targets always link — the `.so` IS the product (pyo3 modules).
-    pub skip_link_pass: bool,
-}
 
 /// Override for a crate's cache key (and optionally its source) when reusing
 /// a cached drv whose inputs have effectively changed.
@@ -67,28 +49,29 @@ pub struct BuildResult {
     pub stderr: String,
 }
 
-/// Build a single crate derivation using a persistent worker, with mid-build
-/// `__META_READY__` signalling for rmeta pipelining.
-#[allow(clippy::too_many_arguments)]
+/// Build a single unit using a persistent worker, with optional mid-build
+/// `__META_READY__` signalling. All language-specific behaviour comes through
+/// `backend`: the script-hooks injection (compiler wrappers, incremental
+/// cache env), the success check, and the unit's display name.
 pub fn build_unit(
-    drv_path: &str,
-    drv: &Derivation,
-    cache: &ArtifactCache,
+    ctx: BuildContext<'_>,
+    backend: &dyn Backend,
     rewriter: &PathRewriter,
     worker: &mut crate::worker::Worker,
     src_override: Option<&SourceOverride>,
-    pl: &PipelineConfig,
     on_meta_ready: impl FnOnce(PathBuf),
 ) -> Result<BuildResult, String> {
+    let BuildContext {
+        drv_path,
+        drv,
+        cache,
+        ..
+    } = ctx;
     let effective_key = match src_override {
         Some(ov) => ArtifactCache::cache_key_with_source(drv_path, &ov.source_hash),
         None => ArtifactCache::cache_key(drv_path),
     };
-    let crate_name = drv
-        .env
-        .get("crateName")
-        .cloned()
-        .unwrap_or_else(|| "unknown".into());
+    let unit_name = backend.unit_name(drv).into_owned();
     let start = std::time::Instant::now();
 
     // No is_cached short-circuit here: the scheduler already filtered cached
@@ -181,13 +164,6 @@ pub fn build_unit(
         script.push_str(&format!("export outputs='{outputs}'\n"));
     }
 
-    let inc_dir = cache.incremental_dir(drv_path);
-    std::fs::create_dir_all(&inc_dir).map_err(|e| format!("creating incremental dir: {e}"))?;
-    script.push_str(&format!(
-        "export EXTRA_RUSTC_FLAGS=\"-C incremental={} ${{EXTRA_RUSTC_FLAGS:-}}\"\n",
-        inc_dir.display()
-    ));
-
     // NIX_BUILD_TOP must be drv-path-stable, NOT effective-key-stable:
     // buildRustCrate passes `--remap-path-prefix=$NIX_BUILD_TOP=/`, and rustc
     // hashes remap-path-prefix into its [TRACKED] options. If the build dir
@@ -226,51 +202,10 @@ source "$stdenv/setup"
 "#,
     );
 
-    // Pipelining: wrap rustc to emit a fat rmeta early and signal via fd 3.
-    // The wrapper is the bob binary itself (`__rustc-wrap`, see
-    // rustc_wrap.rs), so arg classification, JSON-stderr parsing, and
-    // rmeta→rlib polling happen in Rust without forking jq/cp/mv per line.
-    // This /bin/sh shim just bridges PATH lookup of `rustc` to the subcommand.
-    {
-        let wrapper_dir = tmp.join("rustc-wrap");
-        std::fs::create_dir_all(&wrapper_dir).map_err(|e| format!("creating wrapper dir: {e}"))?;
-        let wrapper = wrapper_dir.join("rustc");
-        let self_exe = std::env::current_exe().map_err(|e| format!("resolving self exe: {e}"))?;
-        std::fs::write(
-            &wrapper,
-            format!(
-                "#!/bin/sh\nexec '{}' __rustc-wrap \"$@\"\n",
-                self_exe.display()
-            ),
-        )
-        .map_err(|e| format!("writing rustc wrapper: {e}"))?;
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&wrapper).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&wrapper, perms).ok();
-
-        // Config for rustc_wrap::main(). BOB_REAL_RUSTC is resolved AFTER
-        // `source $stdenv/setup` so PATH already has the toolchain.
-        // completeDeps/completeBuildDeps are bash arrays under structuredAttrs
-        // (declared `-a` by .attrs.sh) and bash can't export arrays — assigning
-        // a scalar to the same name just sets element [0]. Flatten into
-        // distinct BOB_* scalars so the rustc-wrap subprocess inherits them.
-        script.push_str(&format!(
-            concat!(
-                "export BOB_REAL_RUSTC=$(command -v rustc)\n",
-                "export BOB_COMPLETE_DEPS=\"${{completeDeps[*]-}}\"\n",
-                "export BOB_COMPLETE_BUILD_DEPS=\"${{completeBuildDeps[*]-}}\"\n",
-                "export BOB_WRAP_RMETA_DIR='{rmeta_dir}'\n",
-                "export BOB_EXPECTED_RMETA='{expected}'\n",
-                "export BOB_SKIP_LINK_PASS='{skip_link}'\n",
-                "export PATH='{wrap}':$PATH\n",
-            ),
-            rmeta_dir = tmp.join("rmeta").display(),
-            expected = pl.expected_rmeta,
-            skip_link = if pl.skip_link_pass { "1" } else { "" },
-            wrap = wrapper_dir.display(),
-        ));
-    }
+    // Backend-specific injection: compiler wrappers, incremental-cache env,
+    // pipelining config. Everything language-specific lands here; the rest of
+    // this function is pure stdenv/genericBuild replay.
+    script.push_str(&backend.build_script_hooks(&BuildContext { tmp: &tmp, ..ctx })?);
 
     // Use genericBuild but skip the per-phase overhead (dumpVars,
     // showPhaseHeader/Footer, date calls) by overriding those to no-ops.
@@ -303,26 +238,12 @@ exit $rc
 
     let result = worker
         .execute_with_signal(&script_path, &tmp, on_meta_ready)
-        .map_err(|e| format!("worker build {crate_name}: {e}"))?;
+        .map_err(|e| format!("worker build {unit_name}: {e}"))?;
 
     // genericBuild's exit code is unreliable across stdenv versions (errexit
-    // interactions with eval'd phases). Belt-and-braces: only accept the
-    // build if installPhase actually populated $lib (rlib/so for lib crates)
-    // or $out/bin (bin-only crates).
-    let lib_populated = std::fs::read_dir(lib_dir.join("lib"))
-        .map(|d| {
-            d.flatten().any(|e| {
-                e.file_name()
-                    .to_str()
-                    .map(|n| n.ends_with(".rlib") || n.ends_with(".so") || n.ends_with(".a"))
-                    .unwrap_or(false)
-            })
-        })
-        .unwrap_or(false);
-    let bin_populated = std::fs::read_dir(out_dir.join("bin"))
-        .map(|mut d| d.next().is_some())
-        .unwrap_or(false);
-    let success = result.exit_code == 0 && (lib_populated || bin_populated);
+    // interactions with eval'd phases). Belt-and-braces: ask the backend
+    // whether installPhase produced something usable.
+    let success = result.exit_code == 0 && backend.output_populated(&tmp, drv);
     if !success {
         if std::env::var_os("BOB_KEEP_FAILED").is_none() {
             let _ = std::fs::remove_dir_all(&tmp);
@@ -338,7 +259,7 @@ exit $rc
         // behind or it poisons the cache.
         if let Err(e) = hardlink_tree(&tmp, &dest) {
             let _ = std::fs::remove_dir_all(&dest);
-            return Err(format!("committing {crate_name}: {e}"));
+            return Err(format!("committing {unit_name}: {e}"));
         }
         // Signal full completion for any wrapper polling on us (proc-macro/
         // bin/cdylib consumers waiting for the rlib to be fully written).

@@ -1,18 +1,17 @@
-//! Parallel build scheduler with rmeta pipelining.
+//! Parallel build scheduler with optional mid-build pipelining.
 //!
-//! Executes crate builds in parallel, respecting the dependency DAG.
-//! For lib→lib edges, dependents start as soon as the upstream's fat rmeta
-//! (from `--emit=metadata,link`, contains MIR) is written, not when the rlib
-//! is done. proc-macro deps and deps with build.rs (which emit `link`/`env`
-//! files that downstream's configurePhase reads) gate on full completion.
+//! Executes unit builds in parallel, respecting the dependency DAG. Each
+//! dep→dependent edge is classified by the backend's `PipelinePolicy` as
+//! either:
+//!   - **early-signal**: dependent may start once the dep emits
+//!     `__META_READY__` on fd 3 (e.g. Rust rmeta written), or
+//!   - **done**: dependent waits for full commit (e.g. proc-macro `.so`,
+//!     `links` crates whose `lib/{link,env}` are read by downstream's
+//!     configurePhase, or any backend without an early-artifact analogue).
 //!
-//! Mechanism:
-//! - Worker threads pull from `ready`, build, and on completion decrement
-//!   `pending_done` counters of dependents.
-//! - The rustc wrapper writes `__META_READY__ <dir>` to fd 3 (the worker's
-//!   saved stdout) the moment rustc emits the fat rmeta. The worker's reader
-//!   dispatches that to an in-process callback that decrements `pending_rmeta`.
-//! - A crate becomes ready when both counters hit zero.
+//! Worker threads pull from `ready`, build, and on completion decrement
+//! dependents' `pending_done`. The fd-3 callback decrements `pending_rmeta`.
+//! A unit becomes ready when both counters hit zero.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -23,14 +22,11 @@ use std::sync::Condvar;
 use std::sync::Mutex;
 use std::thread;
 
+use crate::backend::{Backend, BuildContext};
 use crate::cache::ArtifactCache;
-use crate::executor::SourceOverride;
-use crate::executor::{self, PipelineConfig};
-use crate::graph::BuildGraph;
+use crate::executor::{self, SourceOverride};
+use crate::graph::{BuildGraph, UnitNode};
 use crate::progress::Progress;
-use crate::rust::pipeline::{
-    artifact_has_link_output, is_pipelineable, lib_filename, needs_link_output,
-};
 
 pub struct SchedulerResult {
     pub failed: usize,
@@ -98,13 +94,24 @@ pub fn run_parallel(
     graph: &BuildGraph,
     cache: &ArtifactCache,
     jobs: usize,
-    bash: &str,
-    stdenv_path: &str,
+    backend: &(dyn Backend + Sync),
     overrides: &HashMap<String, SourceOverride>,
     roots: &[String],
 ) -> SchedulerResult {
     let roots: HashSet<&str> = roots.iter().map(String::as_str).collect();
     let start = std::time::Instant::now();
+    let pl = backend.pipeline();
+    let self_exe = std::env::current_exe().expect("resolving self exe");
+
+    // Worker pool config from any unit's drv — they all share stdenv/builder.
+    let first_drv = graph.nodes.values().next().expect("empty graph");
+    let bash = first_drv.drv.builder.clone();
+    let stdenv_path = first_drv
+        .drv
+        .env
+        .get("stdenv")
+        .expect("drv missing stdenv")
+        .clone();
 
     // Override-aware helpers. Any drv with a SourceOverride uses a composite
     // cache key (drv_path + effective source hash); plain `is_cached(drv)` would
@@ -116,14 +123,17 @@ pub fn run_parallel(
         }
     };
     let artifact_dir = |drv: &str| cache.artifact_dir_by_key(&key_for(drv));
-    let is_cached = |drv: &str, node: &crate::graph::UnitNode| -> bool {
+    let is_cached = |drv: &str, node: &UnitNode| -> bool {
         if !cache.is_cached_key(&key_for(drv)) {
             return false;
         }
-        // Root cdylib targets must have the .so; a prior non-root run may have
-        // committed rlib-only. Absence isn't an error — just means "rebuild".
-        if roots.contains(drv) && needs_link_output(&node.drv) {
-            return artifact_has_link_output(&artifact_dir(drv));
+        // Root targets may have a stricter "sufficient" test than transitive
+        // deps (e.g. Rust cdylib roots need the .so; a prior non-root run may
+        // have committed rlib-only). Absence is just "rebuild", not an error.
+        if roots.contains(drv) {
+            return pl.is_none_or(|p| {
+                p.cached_artifact_sufficient_as_root(&node.drv, &artifact_dir(drv))
+            });
         }
         true
     };
@@ -132,7 +142,7 @@ pub fn run_parallel(
     let pipelineable: HashMap<String, bool> = graph
         .nodes
         .iter()
-        .map(|(k, n)| (k.clone(), is_pipelineable(&n.drv)))
+        .map(|(k, n)| (k.clone(), pl.is_some_and(|p| p.is_pipelineable(&n.drv))))
         .collect();
 
     let mut pending_rmeta: HashMap<String, usize> = HashMap::new();
@@ -216,6 +226,9 @@ pub fn run_parallel(
             let progress = Arc::clone(&progress);
             let tmp_dir = &tmp_dir;
             let roots = &roots;
+            let bash = &bash;
+            let stdenv_path = &stdenv_path;
+            let self_exe = &self_exe;
             s.spawn(move || {
                 let mut worker =
                     crate::worker::Worker::spawn(bash, stdenv_path).expect("spawning worker");
@@ -223,6 +236,8 @@ pub fn run_parallel(
                     &state,
                     &graph.nodes,
                     cache,
+                    backend,
+                    self_exe,
                     &mut worker,
                     &progress,
                     overrides,
@@ -243,8 +258,10 @@ pub fn run_parallel(
 #[allow(clippy::too_many_arguments)]
 fn worker_loop(
     state: &(Mutex<SharedState>, Condvar),
-    nodes: &BTreeMap<String, crate::graph::UnitNode>,
+    nodes: &BTreeMap<String, UnitNode>,
     cache: &ArtifactCache,
+    backend: &dyn Backend,
+    self_exe: &std::path::Path,
     worker: &mut crate::worker::Worker,
     progress: &Progress,
     overrides: &HashMap<String, SourceOverride>,
@@ -311,31 +328,25 @@ fn worker_loop(
         };
 
         let node = &nodes[&drv_path];
-        let crate_name = node
-            .drv
-            .env
-            .get("crateName")
-            .cloned()
-            .unwrap_or_else(|| "unknown".into());
-
-        progress.start(&crate_name);
+        let unit_name = backend.unit_name(&node.drv).into_owned();
+        progress.start(&unit_name);
 
         let rewriter = executor::make_rewriter(&node.drv, &dep_map);
         let src_ov = overrides.get(&drv_path);
-        let pl = PipelineConfig {
-            expected_rmeta: lib_filename(&node.drv, "rmeta").unwrap_or_default(),
-            // Only the explicit build targets need their cdylib/staticlib
-            // output; for transitive deps the rlib is all anyone reads.
-            skip_link_pass: !roots.contains(drv_path.as_str()),
-        };
+        let tmp = tmp_dir(&drv_path);
         let result = executor::build_unit(
-            &drv_path,
-            &node.drv,
-            cache,
+            BuildContext {
+                drv_path: &drv_path,
+                drv: &node.drv,
+                tmp: &tmp,
+                cache,
+                is_root: roots.contains(drv_path.as_str()),
+                self_exe,
+            },
+            backend,
             &rewriter,
             worker,
             src_ov,
-            &pl,
             |_rmeta_dir| {
                 let mut s = lock.lock().unwrap();
                 s.fire_rmeta(&drv_path);
@@ -350,7 +361,7 @@ fn worker_loop(
             match result {
                 Ok(ref r) if r.success => {
                     s.succeeded += 1;
-                    progress.finish(&crate_name, r.duration);
+                    progress.finish(&unit_name, r.duration);
 
                     // output_map already points at tmp/<key>/ (registered when
                     // we started); commit hardlink-copies tmp→artifacts but
@@ -376,12 +387,12 @@ fn worker_loop(
                 Ok(ref r) => {
                     s.failed += 1;
                     s.abort = true;
-                    progress.fail(&crate_name, &r.stdout, &r.stderr);
+                    progress.fail(&unit_name, &r.stdout, &r.stderr);
                 }
                 Err(e) => {
                     s.failed += 1;
                     s.abort = true;
-                    progress.fail(&crate_name, "", &e);
+                    progress.fail(&unit_name, "", &e);
                 }
             }
 
