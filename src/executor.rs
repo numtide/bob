@@ -469,16 +469,18 @@ fn rewrite_structured_attrs_json(
     serde_json::to_string(&val).unwrap_or_else(|_| json_str.to_string())
 }
 
-/// Render a structured-attrs JSON object as bash declarations, mirroring what
-/// Nix's `writeStructuredAttrs` emits to `.attrs.sh`:
-///   - string/number/bool/null → `declare -- k='v'`
-///   - array of strings        → `declare -a k=('v1' 'v2' …)`
-///   - object of strings       → `declare -A k=([k1]='v1' …)`
-///   - anything else (nested objects, mixed arrays) → skipped
+/// Render a structured-attrs JSON object as bash declarations, byte-for-byte
+/// matching Nix's `StructuredAttrs::writeShell` (libstore/parsed-derivations.cc):
+///   - string/int/bool/null → `declare k=<simple>`
+///   - array of simple      → `declare -a k=(<v> <v> …)`
+///   - object of simple     → `declare -A k=(['<ik>']=<v> …)`
+///   - anything else (nested objects, mixed arrays, floats) → skipped
 ///
 /// stdenv/setup's structuredAttrs path iterates `outputs`/`env` as associative
 /// arrays and `*Inputs` as indexed arrays; sourcing this before setup gives it
-/// the shapes it expects without us having to enumerate which keys are arrays.
+/// the shapes it expects. Notably the `env` map (from `mkDerivation { env = … }`)
+/// often carries Nix integers/bools, so the object case must accept non-string
+/// simples or stdenv's `for envVar in "${!env[@]}"` export loop never runs.
 fn json_to_attrs_sh(val: &serde_json::Value) -> String {
     use serde_json::Value;
     let mut out = String::new();
@@ -489,35 +491,38 @@ fn json_to_attrs_sh(val: &serde_json::Value) -> String {
         if !is_valid_bash_ident(k) {
             continue;
         }
-        match v {
-            Value::String(s) => {
-                out.push_str(&format!("declare -- {k}={}\n", sh_escape(s)));
+        if let Some(s) = simple_to_sh(v) {
+            out.push_str(&format!("declare {k}={s}\n"));
+        } else if let Value::Array(a) = v {
+            if let Some(items) = a.iter().map(simple_to_sh).collect::<Option<Vec<_>>>() {
+                out.push_str(&format!("declare -a {k}=({} )\n", items.join(" ")));
             }
-            Value::Number(n) => {
-                out.push_str(&format!("declare -- {k}={n}\n"));
+        } else if let Value::Object(o) = v {
+            if let Some(items) = o
+                .iter()
+                .map(|(ik, iv)| simple_to_sh(iv).map(|s| format!("[{}]={s}", sh_escape(ik))))
+                .collect::<Option<Vec<_>>>()
+            {
+                out.push_str(&format!("declare -A {k}=({} )\n", items.join(" ")));
             }
-            Value::Bool(b) => {
-                out.push_str(&format!("declare -- {k}={}\n", if *b { "1" } else { "" }));
-            }
-            Value::Null => {
-                out.push_str(&format!("declare -- {k}=\n"));
-            }
-            Value::Array(a) if a.iter().all(|v| v.is_string()) => {
-                let items: Vec<String> = a.iter().map(|v| sh_escape(v.as_str().unwrap())).collect();
-                out.push_str(&format!("declare -a {k}=({})\n", items.join(" ")));
-            }
-            Value::Object(o) if o.values().all(|v| v.is_string()) => {
-                let items: Vec<String> = o
-                    .iter()
-                    .filter(|(ik, _)| is_valid_bash_ident(ik))
-                    .map(|(ik, iv)| format!("[{ik}]={}", sh_escape(iv.as_str().unwrap())))
-                    .collect();
-                out.push_str(&format!("declare -A {k}=({})\n", items.join(" ")));
-            }
-            _ => {} // not representable in bash; Nix skips these too
         }
     }
     out
+}
+
+/// Nix's `handleSimpleType`: string → shell-escaped, integer → decimal,
+/// bool → `1`/``, null → `''`. Floats and compound values → None.
+fn simple_to_sh(v: &serde_json::Value) -> Option<String> {
+    use serde_json::Value;
+    match v {
+        Value::String(s) => Some(sh_escape(s)),
+        Value::Number(n) if n.is_i64() => Some(n.as_i64().unwrap().to_string()),
+        Value::Number(n) if n.is_u64() => Some(n.as_u64().unwrap().to_string()),
+        Value::Bool(true) => Some("1".into()),
+        Value::Bool(false) => Some(String::new()),
+        Value::Null => Some("''".into()),
+        _ => None,
+    }
 }
 
 /// POSIX-sh single-quote escaping: wrap in '…', replace embedded ' with '\''.
@@ -614,23 +619,28 @@ mod tests {
             "codegenUnits": 16,
             "nativeBuildInputs": ["/nix/store/a", "/nix/store/b"],
             "outputs": {"out": "/tmp/out", "lib": "/tmp/lib"},
-            "meta": {"NIX_MAIN_PROGRAM": "foo"},
+            "env": {"AWS_LC_SYS_CMAKE_BUILDER": 1, "NIX_MAIN_PROGRAM": "foo"},
             "crateBin": [{"name": "x"}],   // nested → skipped
-            "bad-key": "nope",              // invalid ident → skipped
+            "bad-key": "nope",             // invalid ident → skipped
             "quoted": "it's fine",
+            "nullish": null,
         });
         let sh = json_to_attrs_sh(&json);
-        assert!(sh.contains("declare -- crateName='foo'\n"));
-        assert!(sh.contains("declare -- release=1\n"));
-        assert!(sh.contains("declare -- codegenUnits=16\n"));
-        assert!(sh.contains("declare -a nativeBuildInputs=('/nix/store/a' '/nix/store/b')\n"));
-        assert!(sh.contains("declare -A outputs="));
-        assert!(sh.contains("[out]='/tmp/out'"));
-        assert!(sh.contains("[lib]='/tmp/lib'"));
-        assert!(sh.contains("declare -A meta=([NIX_MAIN_PROGRAM]='foo')\n"));
+        assert!(sh.contains("declare crateName='foo'\n"));
+        assert!(sh.contains("declare release=1\n"));
+        assert!(sh.contains("declare codegenUnits=16\n"));
+        assert!(sh.contains("declare -a nativeBuildInputs=('/nix/store/a' '/nix/store/b' )\n"));
+        assert!(sh.contains("declare -A outputs=("));
+        assert!(sh.contains("['out']='/tmp/out'"));
+        assert!(sh.contains("['lib']='/tmp/lib'"));
+        // env with mixed int/string values must NOT be skipped
+        assert!(sh.contains("declare -A env=("));
+        assert!(sh.contains("['AWS_LC_SYS_CMAKE_BUILDER']=1"));
+        assert!(sh.contains("['NIX_MAIN_PROGRAM']='foo'"));
         assert!(!sh.contains("crateBin"));
         assert!(!sh.contains("bad-key"));
-        assert!(sh.contains("declare -- quoted='it'\\''s fine'\n"));
+        assert!(sh.contains("declare quoted='it'\\''s fine'\n"));
+        assert!(sh.contains("declare nullish=''\n"));
     }
 
     #[test]
