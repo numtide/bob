@@ -35,7 +35,11 @@ struct Cfg {
 impl Cfg {
     fn from_env() -> Self {
         let env = |k: &str| std::env::var(k).unwrap_or_default();
-        let deps = format!("{} {}", env("completeDeps"), env("completeBuildDeps"));
+        let deps = format!(
+            "{} {}",
+            env("BOB_COMPLETE_DEPS"),
+            env("BOB_COMPLETE_BUILD_DEPS")
+        );
         Self {
             real_rustc: env("BOB_REAL_RUSTC"),
             rmeta_dir: PathBuf::from(env("BOB_WRAP_RMETA_DIR")),
@@ -137,35 +141,151 @@ fn poll_until<F: Fn() -> bool>(f: F) {
     }
 }
 
-/// `--extern foo=tmp/<k>/rmeta/libfoo.rmeta` → tmp/<k>.
-fn rmeta_arg_tmp(arg: &str) -> Option<&str> {
-    let p = arg.split_once('=')?.1;
-    if !p.ends_with(".rmeta") {
-        return None;
-    }
-    let i = p.find("/bob/tmp/")?;
-    let after = &p[i + "/bob/tmp/".len()..];
-    let key_end = after.find('/')?;
-    if &after[key_end..key_end + "/rmeta/".len()] != "/rmeta/" {
-        return None;
-    }
-    Some(&p[..i + "/bob/tmp/".len() + key_end])
+/// In-flight `completeDeps` entries are `…/bob/tmp/<k>/lib`; strip to `…/tmp/<k>`.
+fn inflight_tmp(dep: &str) -> Option<&str> {
+    dep.strip_suffix("/lib").filter(|p| p.contains("/bob/tmp/"))
 }
 
-/// Swap each in-flight `--extern …rmeta` arg to its rlib once the dep commits.
-fn swap_rmeta_args_to_rlib(args: &mut [String]) {
-    for a in args.iter_mut() {
-        let Some(dep_tmp) = rmeta_arg_tmp(a) else {
+/// Is this arg a `--extern` value (`name=path`)? `name` is a crate ident
+/// (no `/`, ` `, `-`) and `path` points at a library artifact. This rules out
+/// `-L dependency=target/deps`, `--remap-path-prefix=/a=/b`, `-C link-arg=…`
+/// without needing to peek at the preceding `--extern` token.
+fn extern_arg_path(arg: &str) -> Option<(&str, &str)> {
+    let (name, path) = arg.split_once('=')?;
+    if name.is_empty() || name.contains(['/', ' ', '-']) {
+        return None;
+    }
+    let is_lib = [".rlib", ".rmeta", ".so", ".dylib"]
+        .iter()
+        .any(|e| path.ends_with(e));
+    is_lib.then_some((name, path))
+}
+
+/// Lib-path dep resolution for pipelined builds.
+///
+/// The crate builder's configurePhase symlinks each dep's `$lib/lib/*.{rlib,so}`
+/// into `target/deps/` and passes `--extern foo=target/deps/libfoo-HASH.rlib`.
+/// For in-flight pipelined deps that rlib doesn't exist yet — only the early
+/// rmeta at `tmp/<k>/rmeta/libfoo-HASH.rmeta` does. proc-macro and `links`
+/// deps are done-gated by the scheduler, so their `.so`/`.rlib` is already in
+/// `tmp/<k>/lib/lib/` by the time we run; configurePhase just hasn't seen it.
+///
+/// This (1) symlinks every in-flight dep's `rmeta/*.rmeta` and `lib/lib/*` into
+/// each `-L dependency=` dir so transitive lookup resolves, then (2) rewrites
+/// each missing `--extern …=<p>.rlib` to the `.rmeta`/`.so` sibling that exists.
+fn resolve_lib_deps(cfg: &Cfg, dep_dirs: &[PathBuf], args: &mut [String]) {
+    for i in &cfg.complete_deps {
+        let Some(prefix) = inflight_tmp(i) else {
             continue;
         };
-        let done = format!("{dep_tmp}/done");
-        poll_until(|| Path::new(&done).exists());
-        // tmp/<k>/rmeta/<f>.rmeta → tmp/<k>/lib/lib/<f>.rlib
-        let (name, p) = a.split_once('=').unwrap();
-        let rlib = p
-            .replacen("/rmeta/", "/lib/lib/", 1)
-            .replacen(".rmeta", ".rlib", 1);
-        *a = format!("{name}={rlib}");
+        for src in [format!("{prefix}/rmeta"), format!("{i}/lib")] {
+            let Ok(rd) = std::fs::read_dir(&src) else {
+                continue;
+            };
+            for e in rd.flatten() {
+                let name = e.file_name();
+                let n = name.to_string_lossy();
+                if n.ends_with(".rmeta") || n.ends_with(".rlib") || n.ends_with(".so") {
+                    for d in dep_dirs {
+                        let _ = std::os::unix::fs::symlink(e.path(), d.join(&name));
+                    }
+                }
+            }
+        }
+    }
+    for a in args.iter_mut() {
+        let Some((name, path)) = extern_arg_path(a) else {
+            continue;
+        };
+        if Path::new(path).exists() {
+            continue;
+        }
+        // The builder's fallback guess `lib{extern_name}-{metadata}.rlib` is
+        // wrong when the dep is renamed (`jpeg = { package = "jpeg-decoder" }`)
+        // or has `[lib].name` ≠ package name — normally `find_by_metadata`
+        // corrects it from the symlinked artifact, but target/deps was empty.
+        // The metadata hash IS reliable, so resolve by `-{metadata}.{ext}`
+        // suffix across the dep dirs we just populated.
+        let Some(meta) = lib_metadata_from_path(path) else {
+            continue;
+        };
+        if let Some(found) = find_in_dirs_by_metadata(dep_dirs, meta) {
+            *a = format!("{name}={found}");
+        }
+    }
+}
+
+/// Extract `<metadata>` from `…/lib<name>-<metadata>.<ext>`.
+fn lib_metadata_from_path(path: &str) -> Option<&str> {
+    let file = Path::new(path).file_name()?.to_str()?;
+    let stem = file.rsplit_once('.')?.0;
+    stem.rsplit_once('-').map(|(_, m)| m)
+}
+
+/// Find any `lib*-<metadata>.{rmeta,so,rlib,dylib}` in `dirs`, preferring
+/// rmeta (sufficient for the lib pass, and the only thing in-flight deps
+/// have published yet).
+fn find_in_dirs_by_metadata(dirs: &[PathBuf], metadata: &str) -> Option<String> {
+    let mut fallback = None;
+    for d in dirs {
+        let Ok(rd) = std::fs::read_dir(d) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let n = e.file_name().to_string_lossy().into_owned();
+            let Some(ext) = n
+                .strip_prefix("lib")
+                .and_then(|s| s.rsplit_once('.'))
+                .filter(|(stem, _)| stem.ends_with(&format!("-{metadata}")))
+                .map(|(_, e)| e)
+            else {
+                continue;
+            };
+            let p = e.path().to_string_lossy().into_owned();
+            match ext {
+                "rmeta" => return Some(p),
+                "rlib" | "so" | "dylib" => fallback = Some(p),
+                _ => {}
+            }
+        }
+    }
+    fallback
+}
+
+/// Link-path counterpart: after `wait_closure_done_and_relink` has populated
+/// `target/deps/` with the real rlibs, re-resolve every `--extern` arg whose
+/// path is missing or points at a `.rmeta` (left over from `resolve_lib_deps`
+/// on the lib half of a `lib cdylib` crate). Matched by metadata hash so the
+/// renamed-dep / `[lib].name` correction applies here too.
+fn swap_extern_args_to_rlib(dep_dirs: &[PathBuf], args: &mut [String]) {
+    for a in args.iter_mut() {
+        let Some((name, path)) = extern_arg_path(a) else {
+            continue;
+        };
+        if !path.ends_with(".rmeta") && Path::new(path).exists() {
+            continue;
+        }
+        let Some(meta) = lib_metadata_from_path(path) else {
+            continue;
+        };
+        // After relink, rlib/so are present; prefer those over rmeta.
+        let mut found = None;
+        for d in dep_dirs {
+            let Ok(rd) = std::fs::read_dir(d) else {
+                continue;
+            };
+            for e in rd.flatten() {
+                let n = e.file_name().to_string_lossy().into_owned();
+                if (n.ends_with(".rlib") || n.ends_with(".so") || n.ends_with(".dylib"))
+                    && n.contains(&format!("-{meta}."))
+                {
+                    found = Some(e.path().to_string_lossy().into_owned());
+                }
+            }
+        }
+        if let Some(p) = found {
+            *a = format!("{name}={p}");
+        }
     }
 }
 
@@ -176,8 +296,7 @@ fn swap_rmeta_args_to_rlib(args: &mut [String]) {
 /// `target/deps` left the build-script link without transitive rlibs.
 fn wait_closure_done_and_relink(cfg: &Cfg, dep_dirs: &[PathBuf]) {
     for i in &cfg.complete_deps {
-        // In-flight paths are `…/bob/tmp/<k>/lib`.
-        if let Some(prefix) = i.strip_suffix("/lib").filter(|p| p.contains("/bob/tmp/")) {
+        if let Some(prefix) = inflight_tmp(i) {
             let done = format!("{prefix}/done");
             poll_until(|| Path::new(&done).exists());
         }
@@ -196,32 +315,6 @@ fn wait_closure_done_and_relink(cfg: &Cfg, dep_dirs: &[PathBuf]) {
                     }
                 }
             }
-        }
-    }
-}
-
-/// Lib path: a rewritten dep that's actually a proc-macro at build time
-/// (read-crate-info detection) won't have an rmeta — only its .so under
-/// tmp/<k>/lib/lib/. Fall back to .so/.rlib once committed.
-fn resolve_missing_rmeta_args(args: &mut [String]) {
-    for a in args.iter_mut() {
-        let Some(dep_tmp) = rmeta_arg_tmp(a) else {
-            continue;
-        };
-        let (name, p) = a.split_once('=').unwrap();
-        if Path::new(p).exists() {
-            continue;
-        }
-        let done = format!("{dep_tmp}/done");
-        poll_until(|| Path::new(&done).exists());
-        let base = p
-            .replacen("/rmeta/", "/lib/lib/", 1)
-            .trim_end_matches(".rmeta")
-            .to_string();
-        if Path::new(&format!("{base}.so")).exists() {
-            *a = format!("{name}={base}.so");
-        } else if Path::new(&format!("{base}.rlib")).exists() {
-            *a = format!("{name}={base}.rlib");
         }
     }
 }
@@ -291,11 +384,11 @@ pub fn main(argv: &[String]) -> ! {
     let mut c = classify(argv);
 
     // Anything that LINKS, the build.rs compile, or a build-script probe:
-    // needs rlibs IN. The scheduler optimistically rewrote in-flight deps to
-    // tmp/<k>/rmeta/*.rmeta; swap back after each dep commits.
+    // needs rlibs IN. Wait for every in-flight dep to commit, re-symlink its
+    // rlib/so into target/deps, then exec rustc unchanged.
     if c.lib_types.is_empty() || !c.out_is_target_lib {
-        swap_rmeta_args_to_rlib(&mut c.args);
         wait_closure_done_and_relink(&cfg, &c.dep_dirs);
+        swap_extern_args_to_rlib(&c.dep_dirs, &mut c.args);
         let err = Command::new(&cfg.real_rustc)
             .args(&c.lib_types)
             .args(&c.link_types)
@@ -306,7 +399,7 @@ pub fn main(argv: &[String]) -> ! {
     }
 
     // Lib half: rmetas suffice IN; emit fat rmeta OUT.
-    resolve_missing_rmeta_args(&mut c.args);
+    resolve_lib_deps(&cfg, &c.dep_dirs, &mut c.args);
     let rc = run_lib_with_stream(&cfg, &c.lib_types, &c.args);
 
     // `lib cdylib`/`lib staticlib`: lib half just ran on rmeta deps (signal
@@ -315,8 +408,8 @@ pub fn main(argv: &[String]) -> ! {
     // one pass. Skipped for non-root crates — downstream Rust only reads the
     // rlib, so the `.so` is dead weight unless this crate is the build target.
     let rc2 = if rc == 0 && !c.link_types.is_empty() && !cfg.skip_link_pass {
-        swap_rmeta_args_to_rlib(&mut c.args);
         wait_closure_done_and_relink(&cfg, &c.dep_dirs);
+        swap_extern_args_to_rlib(&c.dep_dirs, &mut c.args);
         Command::new(&cfg.real_rustc)
             .args(&c.link_types)
             .args(&c.args)
@@ -415,10 +508,25 @@ mod tests {
     }
 
     #[test]
-    fn rmeta_tmp_extraction() {
-        let a = "syn=/root/.cache/bob/tmp/abc123/rmeta/libsyn-x.rmeta";
-        assert_eq!(rmeta_arg_tmp(a), Some("/root/.cache/bob/tmp/abc123"));
-        assert_eq!(rmeta_arg_tmp("syn=/artifacts/abc/lib/libsyn.rlib"), None);
+    fn extern_arg_detection() {
+        assert_eq!(
+            extern_arg_path("syn=target/deps/libsyn-x.rlib"),
+            Some(("syn", "target/deps/libsyn-x.rlib"))
+        );
+        assert_eq!(extern_arg_path("dependency=target/deps"), None); // -L value
+        assert_eq!(extern_arg_path("--remap-path-prefix=/a=/b"), None);
+        assert_eq!(extern_arg_path("link-arg=-fuse-ld=mold"), None);
+        assert_eq!(extern_arg_path("syn"), None); // bare --extern
+    }
+
+    #[test]
+    fn inflight_detection() {
+        assert_eq!(
+            inflight_tmp("/root/.cache/bob/tmp/abc123/lib"),
+            Some("/root/.cache/bob/tmp/abc123")
+        );
+        assert_eq!(inflight_tmp("/root/.cache/bob/artifacts/abc123/lib"), None);
+        assert_eq!(inflight_tmp("/nix/store/xxx-foo-1.0/lib"), None);
     }
 
     #[test]

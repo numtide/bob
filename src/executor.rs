@@ -108,8 +108,6 @@ pub fn build_crate_with_worker_signaled(
     let tmp = cache.root().join("tmp").join(&effective_key);
     std::fs::create_dir_all(tmp.join("lib").join("lib"))
         .map_err(|e| format!("creating tmp dir: {e}"))?;
-    let mut env = rewriter.rewrite_env(&drv.env);
-
     // Swap in-flight deps' .rlib paths for their early-written .rmeta. Applied
     // AFTER store-prefix rewrites so they match the already-rewritten cache/tmp
     // paths. Transitive in-flight deps under `-L dependency=target/deps` are
@@ -122,56 +120,82 @@ pub fn build_crate_with_worker_signaled(
             }
         }
     };
-    for v in env.values_mut() {
-        apply_rmeta_rewrites(v);
-    }
 
     let out_dir = tmp.join("out");
     let lib_dir = tmp.join("lib");
 
     let mut script = String::new();
 
-    let env_file = tmp.join("env.sh");
-    {
+    if drv.is_structured_attrs() {
+        // Mirror what Nix's builder does for __structuredAttrs: write both
+        // .attrs.json and .attrs.sh, source .attrs.sh BEFORE $stdenv/setup
+        // so bash arrays (`outputs`, `env`, `*Inputs`, `completeDeps`, …) are
+        // declared with correct types. stdenv/setup keys its structuredAttrs
+        // path on NIX_ATTRS_JSON_FILE being set and then iterates these as
+        // arrays — exporting them as scalars (the env.sh path below) makes
+        // `${!outputs[@]}` / `${!env[@]}` yield index `0` and the build aborts.
+        let json_str = drv
+            .env
+            .get("__json")
+            .ok_or("structuredAttrs drv missing __json")?;
+        let mut rewritten_json = rewrite_structured_attrs_json(
+            json_str,
+            out_dir.to_str().unwrap(),
+            lib_dir.to_str().unwrap(),
+            rewriter,
+            src_override.and_then(|ov| ov.src_path.as_deref()),
+        );
+        apply_rmeta_rewrites(&mut rewritten_json);
+        let json_val: serde_json::Value =
+            serde_json::from_str(&rewritten_json).map_err(|e| format!("parsing __json: {e}"))?;
+        let attrs_sh = json_to_attrs_sh(&json_val);
+
+        let json_path = tmp.join(".attrs.json");
+        let sh_path = tmp.join(".attrs.sh");
+        std::fs::write(&json_path, &rewritten_json)
+            .map_err(|e| format!("writing attrs json: {e}"))?;
+        std::fs::write(&sh_path, &attrs_sh).map_err(|e| format!("writing attrs sh: {e}"))?;
+
+        script.push_str(&format!(
+            "export NIX_ATTRS_JSON_FILE='{}'\n",
+            json_path.display()
+        ));
+        script.push_str(&format!(
+            "export NIX_ATTRS_SH_FILE='{}'\n",
+            sh_path.display()
+        ));
+        script.push_str(&format!("source '{}'\n", sh_path.display()));
+    } else {
+        // Non-structured drv: export every env var verbatim. $'...' quoting
+        // (3ms for ~80 vars) avoids the per-var heredoc fork (200ms).
+        let mut env = rewriter.rewrite_env(&drv.env);
+        for v in env.values_mut() {
+            apply_rmeta_rewrites(v);
+        }
+        let env_file = tmp.join("env.sh");
         let mut ef = String::new();
         for (k, v) in &env {
+            if !is_valid_bash_ident(k) {
+                continue;
+            }
             let escaped = escape_for_dollar_single_quote(v);
             ef.push_str(&format!("export {k}=$'{escaped}'\n"));
         }
         std::fs::write(&env_file, &ef).map_err(|e| format!("writing env file: {e}"))?;
-    }
-    script.push_str(&format!("source '{}'\n", env_file.display()));
-
-    // Override src with local worktree dir when reusing a cached drv across
-    // source changes. unpackPhase will copy it into NIX_BUILD_TOP; the live
-    // dir only ever contains a tiny target/.bob-mtime-cache (cargo's real
-    // target dir is workspace-level), so no filtered snapshot is needed.
-    if let Some(ov) = src_override {
-        if let Some(ref p) = ov.src_path {
-            script.push_str(&format!("export src='{}'\n", p.display()));
+        script.push_str(&format!("source '{}'\n", env_file.display()));
+        if let Some(ov) = src_override {
+            if let Some(ref p) = ov.src_path {
+                script.push_str(&format!("export src='{}'\n", p.display()));
+            }
         }
-    }
-
-    script.push_str(&format!("export out='{}'\n", out_dir.display()));
-    script.push_str(&format!("export lib='{}'\n", lib_dir.display()));
-
-    if drv.is_structured_attrs() {
-        if let Some(json_str) = drv.env.get("__json") {
-            let json_path = tmp.join(".attrs.json");
-            let mut rewritten_json = rewrite_structured_attrs_json(
-                json_str,
-                out_dir.to_str().unwrap(),
-                lib_dir.to_str().unwrap(),
-                rewriter,
-            );
-            apply_rmeta_rewrites(&mut rewritten_json);
-            std::fs::write(&json_path, &rewritten_json)
-                .map_err(|e| format!("writing attrs json: {e}"))?;
-            script.push_str(&format!(
-                "export NIX_ATTRS_JSON_FILE='{}'\n",
-                json_path.display()
-            ));
-        }
+        script.push_str(&format!("export out='{}'\n", out_dir.display()));
+        script.push_str(&format!("export lib='{}'\n", lib_dir.display()));
+        let outputs = drv
+            .env
+            .get("outputs")
+            .cloned()
+            .unwrap_or_else(|| "out".into());
+        script.push_str(&format!("export outputs='{outputs}'\n"));
     }
 
     let inc_dir = cache.incremental_dir(drv_path);
@@ -200,9 +224,6 @@ pub fn build_crate_with_worker_signaled(
     script.push_str(&format!("export TMP='{}'\n", work_dir.display()));
     script.push_str(&format!("export TEMP='{}'\n", work_dir.display()));
     script.push_str("export HOME='/homeless-shelter'\n");
-
-    let outputs = env.get("outputs").cloned().unwrap_or_else(|| "out".into());
-    script.push_str(&format!("export outputs='{outputs}'\n"));
     script.push_str("export dontFixup=1\n");
     script.push_str(&format!("cd '{}'\n", work_dir.display()));
 
@@ -247,10 +268,15 @@ source "$stdenv/setup"
 
         // Config for rustc_wrap::main(). BOB_REAL_RUSTC is resolved AFTER
         // `source $stdenv/setup` so PATH already has the toolchain.
-        // completeDeps/completeBuildDeps come from env.sh (already rewritten).
+        // completeDeps/completeBuildDeps are bash arrays under structuredAttrs
+        // (declared `-a` by .attrs.sh) and bash can't export arrays — assigning
+        // a scalar to the same name just sets element [0]. Flatten into
+        // distinct BOB_* scalars so the rustc-wrap subprocess inherits them.
         script.push_str(&format!(
             concat!(
                 "export BOB_REAL_RUSTC=$(command -v rustc)\n",
+                "export BOB_COMPLETE_DEPS=\"${{completeDeps[*]-}}\"\n",
+                "export BOB_COMPLETE_BUILD_DEPS=\"${{completeBuildDeps[*]-}}\"\n",
                 "export BOB_WRAP_RMETA_DIR='{rmeta_dir}'\n",
                 "export BOB_EXPECTED_RMETA='{expected}'\n",
                 "export BOB_SKIP_LINK_PASS='{skip_link}'\n",
@@ -315,7 +341,9 @@ exit $rc
         .unwrap_or(false);
     let success = result.exit_code == 0 && (lib_populated || bin_populated);
     if !success {
-        let _ = std::fs::remove_dir_all(&tmp);
+        if std::env::var_os("BOB_KEEP_FAILED").is_none() {
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
     } else {
         // commit_key's rename(tmp→artifacts) leaves a window where tmp/<key>
         // doesn't exist; once pipelining lets dependents start mid-build with
@@ -340,7 +368,14 @@ exit $rc
         // resolving for the rest of this run.
         let _ = std::fs::remove_dir_all(&work_dir);
         let _ = std::fs::remove_dir_all(tmp.join("rustc-wrap"));
-        for f in ["builder.sh", "env.sh", "worker-stdout", "worker-stderr"] {
+        for f in [
+            "builder.sh",
+            "env.sh",
+            ".attrs.sh",
+            ".attrs.json",
+            "worker-stdout",
+            "worker-stderr",
+        ] {
             let _ = std::fs::remove_file(tmp.join(f));
         }
     }
@@ -395,22 +430,21 @@ fn hardlink_dir(src: &Path, dest: &Path) -> std::io::Result<()> {
 
 /// Rewrite output paths and dependency paths in the __structuredAttrs JSON
 /// so the build-rust-crate binary sees our cache paths instead of /nix/store.
+/// Also remaps `outputs` from `["out","lib"]` to `{out: <tmp/out>, lib: <tmp/lib>}`
+/// (matching what Nix writes to .attrs.json) and optionally overrides `src`.
 fn rewrite_structured_attrs_json(
     json_str: &str,
     out_path: &str,
     lib_path: &str,
     rewriter: &PathRewriter,
+    src_override: Option<&Path>,
 ) -> String {
-    // Parse, rewrite string values, re-serialize
     let mut val: serde_json::Value = match serde_json::from_str(json_str) {
         Ok(v) => v,
         Err(_) => return json_str.to_string(),
     };
 
     if let serde_json::Value::Object(ref mut map) = val {
-        // Replace outputs with a proper {name: path} map.
-        // In the __json blob, outputs is just ["out", "lib"] (names only).
-        // The build-rust-crate binary expects {"out": "/path", "lib": "/path"}.
         let mut outputs_map = serde_json::Map::new();
         outputs_map.insert(
             "out".into(),
@@ -422,11 +456,91 @@ fn rewrite_structured_attrs_json(
         );
         map.insert("outputs".into(), serde_json::Value::Object(outputs_map));
 
-        // Rewrite all string values that contain /nix/store paths
+        if let Some(src) = src_override {
+            map.insert(
+                "src".into(),
+                serde_json::Value::String(src.to_string_lossy().into_owned()),
+            );
+        }
+
         rewrite_json_values(map, rewriter);
     }
 
     serde_json::to_string(&val).unwrap_or_else(|_| json_str.to_string())
+}
+
+/// Render a structured-attrs JSON object as bash declarations, mirroring what
+/// Nix's `writeStructuredAttrs` emits to `.attrs.sh`:
+///   - string/number/bool/null → `declare -- k='v'`
+///   - array of strings        → `declare -a k=('v1' 'v2' …)`
+///   - object of strings       → `declare -A k=([k1]='v1' …)`
+///   - anything else (nested objects, mixed arrays) → skipped
+///
+/// stdenv/setup's structuredAttrs path iterates `outputs`/`env` as associative
+/// arrays and `*Inputs` as indexed arrays; sourcing this before setup gives it
+/// the shapes it expects without us having to enumerate which keys are arrays.
+fn json_to_attrs_sh(val: &serde_json::Value) -> String {
+    use serde_json::Value;
+    let mut out = String::new();
+    let Value::Object(map) = val else {
+        return out;
+    };
+    for (k, v) in map {
+        if !is_valid_bash_ident(k) {
+            continue;
+        }
+        match v {
+            Value::String(s) => {
+                out.push_str(&format!("declare -- {k}={}\n", sh_escape(s)));
+            }
+            Value::Number(n) => {
+                out.push_str(&format!("declare -- {k}={n}\n"));
+            }
+            Value::Bool(b) => {
+                out.push_str(&format!("declare -- {k}={}\n", if *b { "1" } else { "" }));
+            }
+            Value::Null => {
+                out.push_str(&format!("declare -- {k}=\n"));
+            }
+            Value::Array(a) if a.iter().all(|v| v.is_string()) => {
+                let items: Vec<String> = a.iter().map(|v| sh_escape(v.as_str().unwrap())).collect();
+                out.push_str(&format!("declare -a {k}=({})\n", items.join(" ")));
+            }
+            Value::Object(o) if o.values().all(|v| v.is_string()) => {
+                let items: Vec<String> = o
+                    .iter()
+                    .filter(|(ik, _)| is_valid_bash_ident(ik))
+                    .map(|(ik, iv)| format!("[{ik}]={}", sh_escape(iv.as_str().unwrap())))
+                    .collect();
+                out.push_str(&format!("declare -A {k}=({})\n", items.join(" ")));
+            }
+            _ => {} // not representable in bash; Nix skips these too
+        }
+    }
+    out
+}
+
+/// POSIX-sh single-quote escaping: wrap in '…', replace embedded ' with '\''.
+fn sh_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// Bash identifier: [A-Za-z_][A-Za-z0-9_]*. Keys like `__json` pass; keys like
+/// `foo-bar` or `0abc` are skipped (Nix's .attrs.sh generator does the same).
+fn is_valid_bash_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 fn rewrite_json_values(
@@ -482,11 +596,50 @@ fn escape_for_dollar_single_quote(s: &str) -> String {
 /// of its dependencies.
 pub fn make_rewriter(_drv: &Derivation, dep_cache_map: &BTreeMap<String, PathBuf>) -> PathRewriter {
     let mut rw = PathRewriter::new();
-
-    // Rewrite dependency output paths
     for (store_path, cache_path) in dep_cache_map {
         rw.add(store_path.clone(), cache_path.to_str().unwrap().to_string());
     }
-
     rw
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attrs_sh_shapes() {
+        let json = serde_json::json!({
+            "crateName": "foo",
+            "release": true,
+            "codegenUnits": 16,
+            "nativeBuildInputs": ["/nix/store/a", "/nix/store/b"],
+            "outputs": {"out": "/tmp/out", "lib": "/tmp/lib"},
+            "meta": {"NIX_MAIN_PROGRAM": "foo"},
+            "crateBin": [{"name": "x"}],   // nested → skipped
+            "bad-key": "nope",              // invalid ident → skipped
+            "quoted": "it's fine",
+        });
+        let sh = json_to_attrs_sh(&json);
+        assert!(sh.contains("declare -- crateName='foo'\n"));
+        assert!(sh.contains("declare -- release=1\n"));
+        assert!(sh.contains("declare -- codegenUnits=16\n"));
+        assert!(sh.contains("declare -a nativeBuildInputs=('/nix/store/a' '/nix/store/b')\n"));
+        assert!(sh.contains("declare -A outputs="));
+        assert!(sh.contains("[out]='/tmp/out'"));
+        assert!(sh.contains("[lib]='/tmp/lib'"));
+        assert!(sh.contains("declare -A meta=([NIX_MAIN_PROGRAM]='foo')\n"));
+        assert!(!sh.contains("crateBin"));
+        assert!(!sh.contains("bad-key"));
+        assert!(sh.contains("declare -- quoted='it'\\''s fine'\n"));
+    }
+
+    #[test]
+    fn bash_ident_validation() {
+        assert!(is_valid_bash_ident("foo"));
+        assert!(is_valid_bash_ident("_foo123"));
+        assert!(is_valid_bash_ident("__json"));
+        assert!(!is_valid_bash_ident("0foo"));
+        assert!(!is_valid_bash_ident("foo-bar"));
+        assert!(!is_valid_bash_ident(""));
+    }
 }
