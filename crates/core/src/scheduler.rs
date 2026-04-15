@@ -51,7 +51,6 @@ struct SharedState {
     /// idempotence so dependents are decremented exactly once.
     early_fired: HashSet<String>,
     succeeded: usize,
-    cached: usize,
     failed: usize,
     abort: bool,
     in_flight: usize,
@@ -212,7 +211,6 @@ pub fn run_parallel(
             output_map,
             early_fired: HashSet::new(),
             succeeded: 0,
-            cached: 0,
             failed: 0,
             abort: false,
             in_flight: 0,
@@ -250,7 +248,7 @@ pub fn run_parallel(
 
     let s = state.0.lock().unwrap();
 
-    progress.summary(s.succeeded, cached + s.cached, s.failed, start.elapsed());
+    progress.summary(s.succeeded, cached, s.failed, start.elapsed());
 
     SchedulerResult { failed: s.failed }
 }

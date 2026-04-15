@@ -56,9 +56,7 @@ pub fn cascade(g: &BuildGraph, own: HashMap<String, OwnHash>) -> HashMap<String,
         eff.insert(drv.clone(), h.finalize().to_hex()[..32].to_string());
     }
 
-    let count = eff.len();
-    let result: HashMap<String, SourceOverride> = eff
-        .into_iter()
+    eff.into_iter()
         .map(|(drv, hash)| {
             let ov = SourceOverride {
                 src_path: own.get(&drv).map(|o| o.src_dir.clone()),
@@ -66,8 +64,5 @@ pub fn cascade(g: &BuildGraph, own: HashMap<String, OwnHash>) -> HashMap<String,
             };
             (drv, ov)
         })
-        .collect();
-
-    eprintln!("  \x1b[2mTracking {count} workspace unit(s) for source changes\x1b[0m");
-    result
+        .collect()
 }

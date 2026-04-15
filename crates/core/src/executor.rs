@@ -1,12 +1,13 @@
-//! Build executor: replays buildRustCrate phases outside the Nix sandbox.
+//! Build executor: replays a unit's stdenv `genericBuild` outside the Nix
+//! sandbox.
 //!
-//! For each crate, we:
+//! For each unit:
 //! 1. Create a temp build directory
 //! 2. Export the drv's env vars (with paths rewritten)
-//! 3. Source stdenv/setup
-//! 4. Run genericBuild (which sequences configure → build → install)
+//! 3. Source `$stdenv/setup`
+//! 4. Run `genericBuild` (configure → build → install)
 //!
-//! The output ($out, $lib) is pointed at our cache tmp dir.
+//! Each declared output (`$out`, `$lib`, …) is pointed at our cache tmp dir.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -84,15 +85,16 @@ pub fn build_unit(
     }
 
     // tmp/<key> is reset by the scheduler under lock (before publishing it via
-    // output_map) so dependents can't see stale bytes. lib/lib/ is precreated
-    // so dependents' configure-phase symlink walk over `$dep/lib` doesn't race
-    // a missing dir before this crate's installPhase populates it.
+    // output_map) so dependents can't see stale bytes. One subdir per declared
+    // output (`tmp/<key>/<name>`); backends that need deeper structure ahead
+    // of time create it in `build_script_hooks`.
     let tmp = cache.root().join("tmp").join(&effective_key);
-    std::fs::create_dir_all(tmp.join("lib").join("lib"))
-        .map_err(|e| format!("creating tmp dir: {e}"))?;
-
-    let out_dir = tmp.join("out");
-    let lib_dir = tmp.join("lib");
+    let mut out_paths: BTreeMap<String, String> = BTreeMap::new();
+    for name in drv.outputs.keys() {
+        let p = tmp.join(name);
+        std::fs::create_dir_all(&p).map_err(|e| format!("creating tmp dir: {e}"))?;
+        out_paths.insert(name.clone(), p.to_str().unwrap().to_string());
+    }
 
     let mut script = String::new();
 
@@ -110,8 +112,7 @@ pub fn build_unit(
             .ok_or("structuredAttrs drv missing __json")?;
         let rewritten_json = rewrite_structured_attrs_json(
             json_str,
-            out_dir.to_str().unwrap(),
-            lib_dir.to_str().unwrap(),
+            &out_paths,
             rewriter,
             src_override.and_then(|ov| ov.src_path.as_deref()),
         );
@@ -154,8 +155,9 @@ pub fn build_unit(
                 script.push_str(&format!("export src='{}'\n", p.display()));
             }
         }
-        script.push_str(&format!("export out='{}'\n", out_dir.display()));
-        script.push_str(&format!("export lib='{}'\n", lib_dir.display()));
+        for (name, path) in &out_paths {
+            script.push_str(&format!("export {name}='{path}'\n"));
+        }
         let outputs = drv
             .env
             .get("outputs")
@@ -257,7 +259,7 @@ exit $rc
         // for the rest of this run. is_cached_key only checks dest.exists(),
         // so a partial commit (ENOSPC, SIGKILL mid-copy) must not leave dest
         // behind or it poisons the cache.
-        if let Err(e) = hardlink_tree(&tmp, &dest) {
+        if let Err(e) = hardlink_tree(&tmp, &dest, out_paths.keys().map(String::as_str)) {
             let _ = std::fs::remove_dir_all(&dest);
             return Err(format!("committing {unit_name}: {e}"));
         }
@@ -275,10 +277,10 @@ exit $rc
         // under tmp/. Keep only the subtrees that downstream resolution needs.
         if let Ok(rd) = std::fs::read_dir(&tmp) {
             for e in rd.flatten() {
-                if matches!(
-                    e.file_name().to_str(),
-                    Some("lib" | "out" | "rmeta" | "done")
-                ) {
+                let name = e.file_name();
+                if matches!(name.to_str(), Some("rmeta" | "done"))
+                    || name.to_str().is_some_and(|n| out_paths.contains_key(n))
+                {
                     continue;
                 }
                 let _ = std::fs::remove_dir_all(e.path());
@@ -296,14 +298,17 @@ exit $rc
 }
 
 /// Recursive hardlink-copy (same-fs `cp -al`, without the fork). Only the
-/// `lib`, `out`, and `rmeta` (early-artifact) subtrees are persisted;
-/// `build/` (NIX_BUILD_TOP,
-/// often hundreds of MB of unpacked source + .o files) is intentionally
-/// skipped — the bash `cp -al` was hardlinking it too, which is cheap on disk
-/// but still walks every file.
-fn hardlink_tree(src: &Path, dest: &Path) -> std::io::Result<()> {
+/// declared output subtrees plus `rmeta/` (early-artifact dir) are persisted;
+/// `build/` (NIX_BUILD_TOP, often hundreds of MB of unpacked source + .o
+/// files) is intentionally skipped — the bash `cp -al` was hardlinking it
+/// too, which is cheap on disk but still walks every file.
+fn hardlink_tree<'a>(
+    src: &Path,
+    dest: &Path,
+    outputs: impl Iterator<Item = &'a str>,
+) -> std::io::Result<()> {
     std::fs::create_dir_all(dest)?;
-    for sub in ["lib", "out", "rmeta"] {
+    for sub in outputs.chain(std::iter::once("rmeta")) {
         let s = src.join(sub);
         if s.exists() {
             hardlink_dir(&s, &dest.join(sub))?;

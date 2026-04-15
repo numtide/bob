@@ -14,6 +14,12 @@ use super::pipeline::lib_filename;
 pub fn build_script_hooks(ctx: &BuildContext<'_>) -> Result<String, String> {
     let mut s = String::new();
 
+    // Precreate $lib/lib so dependents that start on our rmeta (before our
+    // installPhase runs) don't ENOENT on configurePhase's symlink walk over
+    // `$dep/lib`.
+    std::fs::create_dir_all(ctx.tmp.join("lib").join("lib"))
+        .map_err(|e| format!("creating lib/lib: {e}"))?;
+
     // -C incremental: rustc reuses frontend/codegen state across rebuilds of
     // the same drv. Keyed on drv_path (not effective key) so source edits
     // don't cold-start the session.

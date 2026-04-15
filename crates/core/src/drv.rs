@@ -238,7 +238,7 @@ impl Derivation {
 
         // With __structuredAttrs, individual env vars are packed into a
         // single __json blob. Unpack them so the rest of bob can
-        // access fields uniformly via env.get("crateName") etc.
+        // access fields uniformly via env.get("name") etc.
         let env = Self::unpack_structured_attrs(env);
 
         Ok(Derivation {

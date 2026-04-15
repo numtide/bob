@@ -6,18 +6,18 @@
 //! provides the store-path rewriting and `outputs`/`src` remapping that bob
 //! applies before emitting both files.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::rewrite::PathRewriter;
 
 /// Rewrite output paths and dependency paths in the `__structuredAttrs` JSON
 /// so the builder sees our cache paths instead of `/nix/store`. Also remaps
-/// `outputs` from `["out","lib"]` to `{out: <tmp/out>, lib: <tmp/lib>}`
-/// (matching what Nix writes to `.attrs.json`) and optionally overrides `src`.
+/// `outputs` from `["out",…]` to `{out: <tmp/out>, …}` (matching what Nix
+/// writes to `.attrs.json`) and optionally overrides `src`.
 pub fn rewrite_structured_attrs_json(
     json_str: &str,
-    out_path: &str,
-    lib_path: &str,
+    outputs: &BTreeMap<String, String>,
     rewriter: &PathRewriter,
     src_override: Option<&Path>,
 ) -> String {
@@ -27,15 +27,10 @@ pub fn rewrite_structured_attrs_json(
     };
 
     if let serde_json::Value::Object(ref mut map) = val {
-        let mut outputs_map = serde_json::Map::new();
-        outputs_map.insert(
-            "out".into(),
-            serde_json::Value::String(out_path.to_string()),
-        );
-        outputs_map.insert(
-            "lib".into(),
-            serde_json::Value::String(lib_path.to_string()),
-        );
+        let outputs_map: serde_json::Map<_, _> = outputs
+            .iter()
+            .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+            .collect();
         map.insert("outputs".into(), serde_json::Value::Object(outputs_map));
 
         if let Some(src) = src_override {

@@ -194,6 +194,10 @@ fn cmd_build(args: &[String]) {
         own.extend(b.workspace_unit_hashes(&repo_root, &g));
     }
     let overrides = overrides::cascade(&g, own);
+    eprintln!(
+        "  \x1b[2mTracking {} workspace unit(s) for source changes\x1b[0m",
+        overrides.len()
+    );
 
     if dump_keys {
         for (drv, node) in &g.nodes {
