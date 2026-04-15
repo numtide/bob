@@ -93,7 +93,7 @@ pub fn run_parallel(
     graph: &BuildGraph,
     cache: &ArtifactCache,
     jobs: usize,
-    backend: &(dyn Backend + Sync),
+    backend: &dyn Backend,
     overrides: &HashMap<String, SourceOverride>,
     roots: &[String],
 ) -> SchedulerResult {

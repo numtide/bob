@@ -10,9 +10,9 @@ use bob_core::{drv, graph, overrides, resolve, scheduler, ArtifactCache, Backend
 /// `scheduler::run_parallel` still takes a single backend (the one that
 /// resolved the root target); per-node backend dispatch in mixed-language
 /// graphs is a follow-up once a second backend exists to test against.
-static BACKENDS: &[&(dyn Backend + Sync)] = &[&bob_rust::RustBackend];
+static BACKENDS: &[&dyn Backend] = &[&bob_rust::RustBackend];
 
-fn backend() -> &'static (dyn Backend + Sync) {
+fn backend() -> &'static dyn Backend {
     BACKENDS[0]
 }
 
