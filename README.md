@@ -50,7 +50,9 @@ bob status                   # cache stats
 bob graph <drv>              # print dependency DAG
 ```
 
-Options: `-j N` (jobs, default nproc), `--repo-root <path>` (default: walk up to `bob.nix`, or `$BOB_REPO_ROOT`).
+Options: `-j N` (jobs, default nproc), `--repo-root <path>` (default: walk up to `bob.nix`, or `$BOB_REPO_ROOT`), `-o/--out-link <path>` (result symlink prefix, default `result`), `--no-out-link`, `--print-out-paths` (artifact paths on stdout).
+
+Result symlinks follow nix-build: `result` → `$out`, `result-lib` → `$lib`; for multiple targets the second and onward get `-2`, `-3`, … suffixes.
 
 ## Cache
 

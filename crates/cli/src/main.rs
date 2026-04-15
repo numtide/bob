@@ -62,6 +62,24 @@ struct BuildArgs {
     #[arg(long, value_name = "PATH")]
     repo_root: Option<PathBuf>,
 
+    /// Result symlink prefix (nix-build style: `<prefix>[-N][-<output>]`)
+    #[arg(
+        short = 'o',
+        long,
+        value_name = "PATH",
+        default_value = "result",
+        conflicts_with = "no_out_link"
+    )]
+    out_link: PathBuf,
+
+    /// Do not create result symlinks
+    #[arg(long, visible_alias = "no-link")]
+    no_out_link: bool,
+
+    /// Print built artifact paths on stdout (one per output, `out` first)
+    #[arg(long)]
+    print_out_paths: bool,
+
     /// Print `<effective-cache-key> <crateName> <drv-path>` for every unit in
     /// the graph and exit. Used by the bench harness to seed workspace crates
     /// whose build scripts bob can't replay.
@@ -196,8 +214,12 @@ fn cmd_build(args: BuildArgs) {
         targets,
         jobs,
         repo_root,
+        out_link,
+        no_out_link,
+        print_out_paths,
         dump_keys,
     } = args;
+    let out_link = (!no_out_link).then_some(out_link);
     let jobs = jobs.unwrap_or_else(|| {
         std::thread::available_parallelism()
             .map(|n| n.get())
@@ -265,8 +287,12 @@ fn cmd_build(args: BuildArgs) {
 
     let result = scheduler::run_parallel(&g, &cache, jobs, backend(), &overrides, &drv_paths);
 
-    // Show output binaries for root crates
-    for r in &resolve_results {
+    // Result symlinks + --print-out-paths, one per (root, output) following
+    // nix-build's naming: <prefix>[-<n>][-<output>], with `-<n>` omitted for
+    // the first root and `-<output>` omitted for `out`. Unlike before, lib-only
+    // roots get a link too (`result-lib`), so callers can locate the artifact
+    // without a second `--dump-keys` round-trip.
+    for (idx, r) in resolve_results.iter().enumerate() {
         let artifact = match overrides.get(&r.drv_path) {
             Some(ov) => cache.artifact_dir_by_key(&ArtifactCache::cache_key_with_source(
                 &r.drv_path,
@@ -274,27 +300,50 @@ fn cmd_build(args: BuildArgs) {
             )),
             None => cache.artifact_dir(&r.drv_path),
         };
-        let out_bin = artifact.join("out").join("bin");
-        let mut bins = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&out_bin) {
+        if !artifact.exists() {
+            // Build failed or aborted before commit; skip silently, the
+            // failure summary already reported it.
+            continue;
+        }
+
+        // Cosmetic: keep listing produced binaries on stderr.
+        if let Ok(entries) = std::fs::read_dir(artifact.join("out").join("bin")) {
             for entry in entries.flatten() {
                 if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                    bins.push(entry.path());
+                    eprintln!("   \x1b[1;32mOutput\x1b[0m {}", entry.path().display());
                 }
             }
         }
-        if !bins.is_empty() {
-            for bin in &bins {
-                eprintln!("   \x1b[1;32mOutput\x1b[0m {}", bin.display());
-            }
 
-            if resolve_results.len() == 1 {
-                let out_dir = artifact.join("out");
-                let link = std::env::current_dir()
-                    .unwrap_or_else(|_| PathBuf::from("."))
-                    .join("result");
+        let n_suffix = if idx == 0 {
+            String::new()
+        } else {
+            format!("-{}", idx + 1)
+        };
+        // `outputs` is a BTreeMap (alphabetical); list `out` first so
+        // `--print-out-paths | head -1` yields the primary output.
+        let outputs = g.nodes[&r.drv_path].drv.outputs.keys();
+        for output in
+            std::iter::once("out").chain(outputs.map(String::as_str).filter(|o| *o != "out"))
+        {
+            let path = artifact.join(output);
+            if !path.exists() {
+                continue;
+            }
+            if print_out_paths {
+                println!("{}", path.display());
+            }
+            if let Some(prefix) = &out_link {
+                let out_suffix = if output == "out" {
+                    String::new()
+                } else {
+                    format!("-{output}")
+                };
+                let link = PathBuf::from(format!("{}{n_suffix}{out_suffix}", prefix.display()));
                 let _ = std::fs::remove_file(&link);
-                let _ = std::os::unix::fs::symlink(&out_dir, &link);
+                if let Err(e) = std::os::unix::fs::symlink(&path, &link) {
+                    eprintln!("warning: creating symlink {}: {e}", link.display());
+                }
             }
         }
     }
