@@ -66,6 +66,7 @@ pub fn build_unit(
     let BuildContext {
         drv_path,
         drv,
+        tmp,
         cache,
         ..
     } = ctx;
@@ -85,11 +86,11 @@ pub fn build_unit(
         let _ = std::fs::remove_dir_all(&dest);
     }
 
-    // tmp/<key> is reset by the scheduler under lock (before publishing it via
-    // output_map) so dependents can't see stale bytes. One subdir per declared
-    // output (`tmp/<key>/<name>`); backends that need deeper structure ahead
-    // of time create it in `build_script_hooks`.
-    let tmp = cache.root().join("tmp").join(&effective_key);
+    // tmp/<key> is owned by the scheduler: it derives the path, resets it
+    // under lock (before publishing via output_map so dependents can't see
+    // stale bytes), and hands it to us via `ctx.tmp`. We add one subdir per
+    // declared output (`tmp/<name>`); backends that need deeper structure
+    // ahead of time create it in `build_script_hooks`.
     let mut out_paths: BTreeMap<String, String> = BTreeMap::new();
     for name in drv.outputs.keys() {
         let p = tmp.join(name);
@@ -209,7 +210,7 @@ source "$stdenv/setup"
     // Backend-specific injection: compiler wrappers, incremental-cache env,
     // pipelining config. Everything language-specific lands here; the rest of
     // this function is pure stdenv/genericBuild replay.
-    script.push_str(&backend.build_script_hooks(&BuildContext { tmp: &tmp, ..ctx })?);
+    script.push_str(&backend.build_script_hooks(&ctx)?);
 
     // Use genericBuild but skip the per-phase overhead (dumpVars,
     // showPhaseHeader/Footer, date calls) by overriding those to no-ops.
@@ -241,16 +242,16 @@ exit $rc
     std::fs::write(&script_path, &script).map_err(|e| format!("writing build script: {e}"))?;
 
     let result = worker
-        .execute_with_signal(&script_path, &tmp, on_meta_ready)
+        .execute_with_signal(&script_path, tmp, on_meta_ready)
         .map_err(|e| format!("worker build {unit_name}: {e}"))?;
 
     // genericBuild's exit code is unreliable across stdenv versions (errexit
     // interactions with eval'd phases). Belt-and-braces: ask the backend
     // whether installPhase produced something usable.
-    let success = result.exit_code == 0 && backend.output_populated(&tmp, drv);
+    let success = result.exit_code == 0 && backend.output_populated(tmp, drv);
     if !success {
         if std::env::var_os("BOB_KEEP_FAILED").is_none() {
-            let _ = std::fs::remove_dir_all(&tmp);
+            let _ = std::fs::remove_dir_all(tmp);
         }
     } else {
         // commit_key's rename(tmp→artifacts) leaves a window where tmp/<key>
@@ -261,7 +262,7 @@ exit $rc
         // for the rest of this run. is_cached_key only checks dest.exists(),
         // so a partial commit (ENOSPC, SIGKILL mid-copy) must not leave dest
         // behind or it poisons the cache.
-        if let Err(e) = hardlink_tree(&tmp, &dest, out_paths.keys().map(String::as_str)) {
+        if let Err(e) = hardlink_tree(tmp, &dest, out_paths.keys().map(String::as_str)) {
             let _ = std::fs::remove_dir_all(&dest);
             return Err(format!("committing {unit_name}: {e}"));
         }
@@ -277,7 +278,7 @@ exit $rc
         let _ = std::fs::remove_dir_all(&work_dir);
         // Backend hooks may leave arbitrary scratch (wrapper-shim dirs, etc.)
         // under tmp/. Keep only the subtrees that downstream resolution needs.
-        if let Ok(rd) = std::fs::read_dir(&tmp) {
+        if let Ok(rd) = std::fs::read_dir(tmp) {
             for e in rd.flatten() {
                 let name = e.file_name();
                 if matches!(name.to_str(), Some("rmeta" | "done"))

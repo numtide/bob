@@ -30,6 +30,10 @@ use crate::overrides::OwnHash;
 /// Per-unit context handed to `Backend::build_script_hooks`. Everything the
 /// backend needs to compute its injection (wrapper shims, incremental dirs,
 /// pipelining config) without the core knowing what any of it means.
+///
+/// `Copy` so the executor can pass it through by value without the
+/// borrow-juggling that `..ctx` struct-update on a moved value invites.
+#[derive(Clone, Copy)]
 pub struct BuildContext<'a> {
     pub drv_path: &'a str,
     pub drv: &'a Derivation,
