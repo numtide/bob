@@ -2,6 +2,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use bob_core::{drv, graph, overrides, resolve, scheduler, ArtifactCache, Backend};
+use clap::{Args, Parser, Subcommand};
 
 /// Registered language backends, tried in order for `resolve_attr` /
 /// `detect_from_cwd` / `dispatch_internal`. `is_unit` and
@@ -16,60 +17,96 @@ fn backend() -> &'static dyn Backend {
     BACKENDS[0]
 }
 
+#[derive(Parser)]
+#[command(
+    name = "bob",
+    about = "Bob the Builder — fast incremental builds via Nix drv replay + caching"
+)]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Build workspace members or .drv paths
+    Build(BuildArgs),
+    /// Remove cached artifacts
+    Clean(CleanArgs),
+    /// Show cache statistics
+    Status,
+    /// Parse a .drv file and print its contents
+    ParseDrv {
+        /// Path to the .drv file
+        path: PathBuf,
+    },
+    /// Show the unit dependency graph for one or more .drv paths
+    Graph {
+        /// Root .drv paths
+        #[arg(required = true)]
+        drv_paths: Vec<String>,
+    },
+}
+
+#[derive(Args)]
+struct BuildArgs {
+    /// Workspace member name, `.` (cwd detection), or raw /nix/store/….drv
+    #[arg(required = true)]
+    targets: Vec<String>,
+
+    /// Parallel jobs (default: nproc)
+    #[arg(short = 'j', long, value_name = "N")]
+    jobs: Option<usize>,
+
+    /// Repo root containing bob.nix (default: walk up from cwd, or $BOB_REPO_ROOT)
+    #[arg(long, value_name = "PATH")]
+    repo_root: Option<PathBuf>,
+
+    /// Print `<effective-cache-key> <crateName> <drv-path>` for every unit in
+    /// the graph and exit. Used by the bench harness to seed workspace crates
+    /// whose build scripts bob can't replay.
+    #[arg(long, hide = true)]
+    dump_keys: bool,
+}
+
+#[derive(Args)]
+#[command(group = clap::ArgGroup::new("what").required(true))]
+struct CleanArgs {
+    /// Remove all artifacts + incremental cache
+    #[arg(long, group = "what")]
+    all: bool,
+
+    /// Remove only the incremental compilation cache
+    #[arg(long, group = "what")]
+    incremental: bool,
+
+    /// Remove artifacts for a specific workspace member (requires eval cache)
+    #[arg(group = "what")]
+    member: Option<String>,
+}
+
 fn main() {
+    // Internal wrapper-shim re-entries (`bob __<backend>-wrap …`). Dispatched
+    // before clap — hot path, invoked once per compiler call, and the trailing
+    // args are arbitrary compiler argv that clap mustn't try to interpret. A
+    // backend that claims `cmd` diverges via process::exit; if we fall through
+    // the loop, nobody claimed it.
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        print_usage();
+    if let Some(cmd) = args.get(1).filter(|a| a.starts_with("__")) {
+        for b in BACKENDS {
+            b.dispatch_internal(cmd, &args[2..]);
+        }
+        eprintln!("unknown internal command: {cmd}");
         std::process::exit(1);
     }
 
-    match args[1].as_str() {
-        // Internal wrapper-shim re-entries (`bob __<backend>-wrap …`).
-        // Dispatched first — hot path, invoked once per compiler call. A
-        // backend that claims `cmd` diverges via process::exit; if we fall
-        // through the loop, nobody claimed it.
-        cmd if cmd.starts_with("__") => {
-            for b in BACKENDS {
-                b.dispatch_internal(cmd, &args[2..]);
-            }
-            eprintln!("unknown internal command: {cmd}");
-            std::process::exit(1);
-        }
-        "build" => cmd_build(&args[2..]),
-        "clean" => cmd_clean(&args[2..]),
-        "status" => cmd_status(),
-        "parse-drv" => cmd_parse_drv(&args[2..]),
-        "graph" => cmd_graph(&args[2..]),
-        "help" | "--help" | "-h" => print_usage(),
-        other => {
-            eprintln!("unknown command: {other}");
-            eprintln!();
-            print_usage();
-            std::process::exit(1);
-        }
+    match Cli::parse().cmd {
+        Cmd::Build(a) => cmd_build(a),
+        Cmd::Clean(a) => cmd_clean(a),
+        Cmd::Status => cmd_status(),
+        Cmd::ParseDrv { path } => cmd_parse_drv(&path),
+        Cmd::Graph { drv_paths } => cmd_graph(&drv_paths),
     }
-}
-
-fn print_usage() {
-    eprintln!("Bob the Builder — fast incremental builds via Nix drv replay + caching");
-    eprintln!();
-    eprintln!("usage: bob <command> [args...]");
-    eprintln!();
-    eprintln!("commands:");
-    eprintln!("  build [opts] <target>...   Build workspace members or drv paths");
-    eprintln!("  clean [crate|--all]        Remove cached artifacts");
-    eprintln!("  status                     Show cache statistics");
-    eprintln!("  parse-drv <path>           Parse a .drv file and print contents");
-    eprintln!("  graph <drv-path>...        Show dependency graph");
-    eprintln!();
-    eprintln!("build targets:");
-    eprintln!("  <name>                     Workspace member (e.g., hello-rs)");
-    eprintln!("  .                          Detect crate from current directory");
-    eprintln!("  /nix/store/....drv         Raw drv path");
-    eprintln!();
-    eprintln!("build options:");
-    eprintln!("  -j N                       Parallel jobs (default: nproc)");
-    eprintln!("  --repo-root <path>         Repo root containing bob.nix (default: auto-detect)");
 }
 
 /// Find the repo root by walking up from cwd looking for `bob.nix`.
@@ -154,43 +191,18 @@ fn predicate_key() -> String {
         .join(",")
 }
 
-fn cmd_build(args: &[String]) {
-    if args.is_empty() {
-        eprintln!("usage: bob build [-j N] [--repo-root <path>] <target>...");
-        std::process::exit(1);
-    }
-
-    let mut jobs = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-    let mut repo_root: Option<PathBuf> = None;
-    let mut targets: Vec<String> = Vec::new();
-    let mut dump_keys = false;
-
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "-j" => {
-                i += 1;
-                jobs = args[i].parse().expect("invalid job count");
-            }
-            "--repo-root" => {
-                i += 1;
-                repo_root = Some(PathBuf::from(&args[i]));
-            }
-            // Print `<effective-cache-key> <crateName> <drv-path>` for every
-            // crate in the graph and exit. Used by the bench harness to seed
-            // workspace crates whose build scripts bob can't replay.
-            "--dump-keys" => dump_keys = true,
-            other => targets.push(other.to_string()),
-        }
-        i += 1;
-    }
-
-    if targets.is_empty() {
-        eprintln!("error: no targets given");
-        std::process::exit(1);
-    }
+fn cmd_build(args: BuildArgs) {
+    let BuildArgs {
+        targets,
+        jobs,
+        repo_root,
+        dump_keys,
+    } = args;
+    let jobs = jobs.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+    });
 
     let cache = ArtifactCache::new();
     let _lock = cache.lock_exclusive().unwrap_or_else(|e| {
@@ -292,23 +304,14 @@ fn cmd_build(args: &[String]) {
     }
 }
 
-fn cmd_clean(args: &[String]) {
+fn cmd_clean(args: CleanArgs) {
     let cache = ArtifactCache::new();
     let _lock = cache.lock_exclusive().unwrap_or_else(|e| {
         eprintln!("error: {e}");
         std::process::exit(1);
     });
 
-    if args.is_empty() || args[0] == "--help" {
-        eprintln!("usage: bob clean [--all | --incremental | <member-name>]");
-        eprintln!();
-        eprintln!("  --all           Remove all artifacts + incremental cache");
-        eprintln!("  --incremental   Remove only incremental compilation cache");
-        eprintln!("  <name>          Remove artifacts for a specific member (requires eval cache)");
-        std::process::exit(1);
-    }
-
-    if args[0] == "--all" {
+    if args.all {
         let root = cache.root();
         for subdir in &["artifacts", "incremental", "tmp", "rmeta", "build"] {
             let path = root.join(subdir);
@@ -322,7 +325,7 @@ fn cmd_clean(args: &[String]) {
         return;
     }
 
-    if args[0] == "--incremental" {
+    if args.incremental {
         let path = cache.root().join("incremental");
         if path.exists() {
             let size = dir_size(&path);
@@ -334,8 +337,9 @@ fn cmd_clean(args: &[String]) {
         return;
     }
 
-    // Clean a specific member — need to find its drv path
-    let member = &args[0];
+    // Clean a specific member — need to find its drv path. clap's ArgGroup
+    // guarantees exactly one of all/incremental/member is set.
+    let member = args.member.as_deref().unwrap();
     let repo_root = find_repo_root().expect("could not find repo root");
 
     match resolve_target(member, &repo_root, &cache) {
@@ -402,8 +406,7 @@ fn cmd_status() {
     eprintln!("  total: {}", format_size(total));
 }
 
-fn cmd_parse_drv(args: &[String]) {
-    let path = args.first().expect("missing drv path");
+fn cmd_parse_drv(path: &Path) {
     let contents = std::fs::read(path).expect("failed to read drv file");
     match drv::Derivation::parse(&contents) {
         Ok(d) => {
@@ -433,14 +436,8 @@ fn cmd_parse_drv(args: &[String]) {
     }
 }
 
-fn cmd_graph(args: &[String]) {
-    if args.is_empty() {
-        eprintln!("usage: bob graph <drv-path>...");
-        std::process::exit(1);
-    }
-
-    let roots: Vec<String> = args.to_vec();
-    match graph::BuildGraph::from_roots(&roots, is_unit) {
+fn cmd_graph(roots: &[String]) {
+    match graph::BuildGraph::from_roots(roots, is_unit) {
         Ok(g) => {
             println!("units in graph: {}", g.unit_count());
             println!("topological order:");

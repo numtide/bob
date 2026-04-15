@@ -14,3 +14,4 @@ path = "src/main.rs"
 [dependencies]
 bob-core.workspace = true
 bob-rust.workspace = true
+clap.workspace = true
