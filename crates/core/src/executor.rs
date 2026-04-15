@@ -21,27 +21,28 @@ use crate::cache::ArtifactCache;
 use crate::drv::Derivation;
 use crate::rewrite::PathRewriter;
 
-/// Override for a crate's cache key (and optionally its source) when reusing
+/// Override for a unit's cache key (and optionally its source) when reusing
 /// a cached drv whose inputs have effectively changed.
 ///
-/// `source_hash` is the *effective* hash: it incorporates this crate's own
+/// `source_hash` is the *effective* hash: it incorporates this unit's own
 /// source content AND the effective hashes of all its workspace deps. This
 /// cascades invalidation through the DAG without changing drv paths, so a
-/// change to a workspace crate's source produces a new key for that crate and
-/// every downstream workspace crate, while crates.io deps (which never sit
-/// downstream of workspace crates) keep their plain `blake3(drv_path)` key.
+/// change to a workspace unit's source produces a new key for that unit and
+/// every downstream workspace unit, while external (registry) deps — which
+/// never sit downstream of workspace units — keep their plain
+/// `blake3(drv_path)` key.
 #[derive(Clone, Debug)]
 pub struct SourceOverride {
     /// Local source directory to use instead of the store path in the drv.
-    /// `None` when only the cache key changes (i.e., this crate's own source
+    /// `None` when only the cache key changes (i.e., this unit's own source
     /// is unchanged but a dep's effective hash differs) — currently every
-    /// overridden crate is a workspace crate so this is always `Some`.
+    /// overridden unit is a workspace unit so this is always `Some`.
     pub src_path: Option<PathBuf>,
     /// Effective source hash, mixed into the cache key.
     pub source_hash: String,
 }
 
-/// Result of executing a single crate build.
+/// Result of executing a single unit build.
 #[derive(Debug)]
 pub struct BuildResult {
     pub success: bool,
@@ -166,13 +167,14 @@ pub fn build_unit(
         script.push_str(&format!("export outputs='{outputs}'\n"));
     }
 
-    // NIX_BUILD_TOP must be drv-path-stable, NOT effective-key-stable:
-    // buildRustCrate passes `--remap-path-prefix=$NIX_BUILD_TOP=/`, and rustc
-    // hashes remap-path-prefix into its [TRACKED] options. If the build dir
-    // moves whenever source changes (tmp/<effective_key>/build), the remap
-    // value moves with it and rustc invalidates the whole incremental session
-    // — paying dep-graph serialisation for nothing. Keying on drv_path (same
-    // key incremental_dir uses) keeps both stable across source edits.
+    // NIX_BUILD_TOP must be drv-path-stable, NOT effective-key-stable: many
+    // builders bake $NIX_BUILD_TOP into compiler options that affect
+    // incremental-state validity (e.g. `--remap-path-prefix=$NIX_BUILD_TOP=/`
+    // is hashed into rustc's [TRACKED] options). If the build dir moves
+    // whenever source changes (tmp/<effective_key>/build), that value moves
+    // with it and the backend's incremental cache cold-starts. Keying on
+    // drv_path (same key `incremental_dir` uses) keeps both stable across
+    // source edits.
     let work_dir = cache
         .root()
         .join("build")
@@ -188,7 +190,7 @@ pub fn build_unit(
     script.push_str("export dontFixup=1\n");
     script.push_str(&format!("cd '{}'\n", work_dir.display()));
 
-    // Source $stdenv/setup with this crate's real *Inputs in scope so stdenv's
+    // Source $stdenv/setup with this unit's real *Inputs in scope so stdenv's
     // input-processing machinery runs setup-hooks (cc-wrapper, pkg-config,
     // python3, rust-bindgen-hook, protobuf, ...). The worker's pre-sourced
     // stdenv had empty inputs, so PKG_CONFIG_PATH/LIBCLANG_PATH/PYTHONPATH/
@@ -213,8 +215,8 @@ source "$stdenv/setup"
     // showPhaseHeader/Footer, date calls) by overriding those to no-ops.
     //
     // genericBuild's exit code must be captured explicitly: stdenv/setup turns
-    // on `set -eu`, but buildRustCrate's buildPhase string is run via `eval`
-    // and intermediate `runHook` calls mask failures, so a failed rustc would
+    // on `set -eu`, but phase strings run via `eval` and intermediate
+    // `runHook` calls can mask failures, so a failed compiler invocation may
     // fall through to installPhase and exit 0. The timing echo would mask it
     // either way. `set +e` makes the rc capture deterministic regardless of
     // what stdenv does to errexit.
@@ -253,8 +255,8 @@ exit $rc
     } else {
         // commit_key's rename(tmp→artifacts) leaves a window where tmp/<key>
         // doesn't exist; once pipelining lets dependents start mid-build with
-        // tmp/<key> paths embedded in their crate metadata, a transitive lookup
-        // hitting that window E0463s. Hardlink-copy lib/out/rmeta into
+        // tmp/<key> paths embedded in their compiler metadata, a transitive
+        // lookup hitting that window fails. Hardlink-copy outputs+rmeta into
         // artifacts/<key> (same-fs, ~free) and keep those subdirs of tmp/<key>
         // for the rest of this run. is_cached_key only checks dest.exists(),
         // so a partial commit (ENOSPC, SIGKILL mid-copy) must not leave dest
@@ -263,14 +265,14 @@ exit $rc
             let _ = std::fs::remove_dir_all(&dest);
             return Err(format!("committing {unit_name}: {e}"));
         }
-        // Signal full completion for any wrapper polling on us (proc-macro/
-        // bin/cdylib consumers waiting for the rlib to be fully written).
+        // Signal full completion for any wrapper polling on us (consumers that
+        // need the linkable artifact, not just the early metadata).
         let _ = std::fs::write(tmp.join("done"), b"");
         // tmp/<key> is reset by the scheduler only when the SAME key rebuilds;
-        // workspace edits produce new keys and crates.io deps never rebuild,
-        // so build/ (NIX_BUILD_TOP — unpacked source, .o files, cmake trees for
-        // -sys crates) would otherwise leak permanently. lib/out/rmeta/done
-        // stay so embedded metadata paths and the wrapper's done-poll keep
+        // workspace edits produce new keys and external deps never rebuild, so
+        // build/ (NIX_BUILD_TOP — unpacked source, object files, native build
+        // trees) would otherwise leak permanently. Outputs + rmeta/done stay
+        // so embedded metadata paths and the wrapper's done-poll keep
         // resolving for the rest of this run.
         let _ = std::fs::remove_dir_all(&work_dir);
         // Backend hooks may leave arbitrary scratch (wrapper-shim dirs, etc.)
@@ -341,8 +343,8 @@ fn hardlink_dir(src: &Path, dest: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Build a PathRewriter for a crate given its drv and the cache locations
-/// of its dependencies.
+/// Build a PathRewriter for a unit given the cache locations of its
+/// dependencies.
 pub fn make_rewriter(_drv: &Derivation, dep_cache_map: &BTreeMap<String, PathBuf>) -> PathRewriter {
     let mut rw = PathRewriter::new();
     for (store_path, cache_path) in dep_cache_map {

@@ -1,7 +1,8 @@
 //! Content-addressed artifact cache.
 //!
 //! Cache key = blake3(drv_path) — the drv path already encodes all inputs
-//! (source hash, dep hashes, rustc flags, features) via Nix's own hashing.
+//! (source hash, dep hashes, compiler flags, feature selection) via Nix's
+//! own hashing.
 //!
 //! Layout:
 //!   $XDG_CACHE_HOME/bob/
@@ -74,10 +75,10 @@ impl ArtifactCache {
         &self.root
     }
 
-    /// Persistent incremental compilation cache for a crate.
-    /// Unlike artifact_dir (which is replaced on each build),
-    /// the incremental dir persists across builds so rustc can
-    /// reuse compilation state.
+    /// Persistent per-unit incremental-compilation state. Unlike
+    /// `artifact_dir` (replaced on each build), this persists across builds
+    /// so the backend's compiler can reuse work (`-C incremental`, `GOCACHE`,
+    /// …). Keyed on drv_path so source edits don't cold-start it.
     pub fn incremental_dir(&self, drv_path: &str) -> PathBuf {
         self.root
             .join("incremental")
