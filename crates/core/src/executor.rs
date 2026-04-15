@@ -88,15 +88,16 @@ pub fn build_unit(
 
     // tmp/<key> is owned by the scheduler: it derives the path, resets it
     // under lock (before publishing via output_map so dependents can't see
-    // stale bytes), and hands it to us via `ctx.tmp`. We add one subdir per
-    // declared output (`tmp/<name>`); backends that need deeper structure
-    // ahead of time create it in `build_script_hooks`.
-    let mut out_paths: BTreeMap<String, String> = BTreeMap::new();
-    for name in drv.outputs.keys() {
-        let p = tmp.join(name);
-        std::fs::create_dir_all(&p).map_err(|e| format!("creating tmp dir: {e}"))?;
-        out_paths.insert(name.clone(), p.to_str().unwrap().to_string());
-    }
+    // stale bytes), and hands it to us via `ctx.tmp`. Output subdirs are NOT
+    // pre-created — the Nix sandbox doesn't either, and builders commonly
+    // `mkdir $out` (no -p), which fails if it already exists. Backends that
+    // need a subtree to exist before genericBuild (e.g. `$lib/lib` for
+    // pipelined dependents) create it in `build_script_hooks`.
+    let out_paths: BTreeMap<String, String> = drv
+        .outputs
+        .keys()
+        .map(|name| (name.clone(), tmp.join(name).to_str().unwrap().to_string()))
+        .collect();
 
     let mut script = String::new();
 
@@ -221,17 +222,21 @@ source "$stdenv/setup"
     // fall through to installPhase and exit 0. The timing echo would mask it
     // either way. `set +e` makes the rc capture deterministic regardless of
     // what stdenv does to errexit.
+    //
+    // EPOCHREALTIME's decimal separator follows LC_NUMERIC. The worker pins
+    // LC_ALL=C, but strip either `.` or `,` anyway so a stray locale export
+    // from a setup hook can't break the arithmetic.
     script.push_str(
         r#"
 dumpVars() { :; }
 showPhaseHeader() { :; }
 showPhaseFooter() { :; }
 
-_t0=${EPOCHREALTIME/./}
+_t0=${EPOCHREALTIME/[.,]/}
 set +e
 genericBuild
 rc=$?
-_t1=${EPOCHREALTIME/./}
+_t1=${EPOCHREALTIME/[.,]/}
 echo "__TIMING__ phases=$(( (_t1-_t0)/1000 ))ms" >&2
 exit $rc
 "#,

@@ -46,8 +46,14 @@ impl Worker {
         // stdenv is sourced inside each build script (after env.sh), not here
         // — input processing must see the crate's real *Inputs. We pre-source
         // it once anyway to fail fast if the toolchain is broken.
+        //
+        // Locale is forced to C: the Nix sandbox has no LC_*/LANG, and host
+        // locale leaking into the replay changes sort order, regex character
+        // classes, decimal separators (EPOCHREALTIME, printf %f), etc.
         let init = format!(
             r#"
+export LC_ALL=C
+unset LANG LANGUAGE
 export out=/dev/null
 export lib=/dev/null
 export outputs="out lib"
