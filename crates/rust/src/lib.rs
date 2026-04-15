@@ -47,6 +47,12 @@ impl Backend for RustBackend {
         workspace::detect_from_cwd()
     }
 
+    fn list_targets(&self, repo_root: &Path) -> Vec<String> {
+        workspace::workspace_members(repo_root)
+            .map(|m| m.into_keys().collect())
+            .unwrap_or_default()
+    }
+
     fn workspace_unit_hashes(
         &self,
         repo_root: &Path,

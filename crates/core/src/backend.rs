@@ -75,6 +75,12 @@ pub trait Backend: Send + Sync {
     /// Detect a target name from cwd by looking for the backend's manifest.
     fn detect_from_cwd(&self) -> Option<String>;
 
+    /// Known target names under `repo_root`. Used by the cli to suggest
+    /// candidates when no backend's `resolve_attr` matches.
+    fn list_targets(&self, _repo_root: &Path) -> Vec<String> {
+        Vec::new()
+    }
+
     // ── source-change tracking ─────────────────────────────────────────────
 
     /// `drv_path → (own_source_hash, live_src_dir)` for every workspace unit

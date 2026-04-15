@@ -118,7 +118,22 @@ fn resolve_target(
     let (b, attr) = BACKENDS
         .iter()
         .find_map(|b| b.resolve_attr(&name, repo_root).map(|a| (*b, a)))
-        .ok_or_else(|| format!("unknown target '{name}'"))?;
+        .ok_or_else(|| {
+            let mut avail: Vec<String> = BACKENDS
+                .iter()
+                .flat_map(|b| b.list_targets(repo_root))
+                .collect();
+            avail.sort();
+            avail.truncate(10);
+            if avail.is_empty() {
+                format!("unknown target '{name}'")
+            } else {
+                format!(
+                    "unknown target '{name}'. some available: {}",
+                    avail.join(", ")
+                )
+            }
+        })?;
     let lock_hash = b.lock_hash(repo_root)?;
 
     let eval_cache = resolve::EvalCache::new(cache.root());
