@@ -187,7 +187,16 @@ fn cmd_build(args: &[String]) {
         i += 1;
     }
 
+    if targets.is_empty() {
+        eprintln!("error: no targets given");
+        std::process::exit(1);
+    }
+
     let cache = ArtifactCache::new();
+    let _lock = cache.lock_exclusive().unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    });
     let repo_root = repo_root
         .or_else(|| find_repo_root().ok())
         .expect("could not find repo root — pass --repo-root, set BOB_REPO_ROOT, or add a bob.nix");
@@ -285,6 +294,10 @@ fn cmd_build(args: &[String]) {
 
 fn cmd_clean(args: &[String]) {
     let cache = ArtifactCache::new();
+    let _lock = cache.lock_exclusive().unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    });
 
     if args.is_empty() || args[0] == "--help" {
         eprintln!("usage: bob clean [--all | --incremental | <member-name>]");
