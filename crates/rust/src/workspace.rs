@@ -7,6 +7,31 @@ use std::path::{Path, PathBuf};
 
 use bob_core::resolve::EvalCache;
 use bob_core::{BuildGraph, OwnHash};
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+struct Manifest {
+    #[serde(default)]
+    package: Option<Package>,
+    #[serde(default)]
+    workspace: Option<Workspace>,
+}
+
+#[derive(Deserialize)]
+struct Package {
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct Workspace {
+    #[serde(default)]
+    members: Vec<String>,
+}
+
+fn read_manifest(dir: &Path) -> Option<Manifest> {
+    let s = std::fs::read_to_string(dir.join("Cargo.toml")).ok()?;
+    toml::from_str(&s).ok()
+}
 
 /// blake3 of `Cargo.lock` — gates the eval-cache (drv reuse is sound as long
 /// as the dependency graph is unchanged).
@@ -17,59 +42,57 @@ pub fn lock_hash(repo_root: &Path) -> Result<String, String> {
 }
 
 /// `package_name → relative_path` from the root `Cargo.toml`'s
-/// `[workspace].members`.
+/// `[workspace].members`, with glob expansion (same `glob` crate Cargo uses).
 pub fn workspace_members(repo_root: &Path) -> Result<BTreeMap<String, PathBuf>, String> {
-    let cargo_toml = repo_root.join("Cargo.toml");
-    let contents = std::fs::read_to_string(&cargo_toml)
-        .map_err(|e| format!("reading {}: {e}", cargo_toml.display()))?;
+    let entries = read_manifest(repo_root)
+        .ok_or_else(|| format!("reading/parsing {}/Cargo.toml", repo_root.display()))?
+        .workspace
+        .map(|w| w.members)
+        .unwrap_or_default();
 
     let mut members = BTreeMap::new();
-    let mut in_members = false;
-
-    for line in contents.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("members") && trimmed.contains('[') {
-            in_members = true;
-            continue;
-        }
-        if in_members {
-            if trimmed.starts_with(']') {
-                in_members = false;
-                continue;
-            }
-            let item = trimmed.trim_matches(|c: char| c == '"' || c == ',' || c.is_whitespace());
-            if !item.is_empty() && !item.starts_with('#') {
-                if let Some(name) = read_package_name(&repo_root.join(item)) {
-                    members.insert(name, PathBuf::from(item));
-                }
+    for entry in &entries {
+        for rel in expand_member(repo_root, entry)? {
+            if let Some(name) = read_package_name(&repo_root.join(&rel)) {
+                members.insert(name, rel);
             }
         }
     }
-
     Ok(members)
+}
+
+/// Expand one `[workspace].members` entry. Cargo treats every entry as a glob,
+/// but `glob::glob_with` walks the filesystem component-by-component (≈2
+/// `statx` per component) even for literal patterns — on a 450-member
+/// workspace with absolute repo_root that's ~15k extra syscalls per call. So
+/// short-circuit literals and only glob when there's an actual metacharacter.
+fn expand_member(repo_root: &Path, entry: &str) -> Result<Vec<PathBuf>, String> {
+    if !entry.contains(['*', '?', '[']) {
+        return Ok(vec![PathBuf::from(entry)]);
+    }
+    // require_literal_separator matches Cargo: `*` never crosses `/`.
+    let opts = glob::MatchOptions {
+        require_literal_separator: true,
+        ..Default::default()
+    };
+    let pattern = repo_root.join(entry);
+    let mut out = Vec::new();
+    for hit in glob::glob_with(&pattern.to_string_lossy(), opts)
+        .map_err(|e| format!("bad members glob '{entry}': {e}"))?
+        .flatten()
+    {
+        out.push(
+            hit.strip_prefix(repo_root)
+                .map(Path::to_path_buf)
+                .unwrap_or(hit),
+        );
+    }
+    Ok(out)
 }
 
 /// `[package].name` from `dir/Cargo.toml`.
 pub fn read_package_name(dir: &Path) -> Option<String> {
-    let contents = std::fs::read_to_string(dir.join("Cargo.toml")).ok()?;
-    let mut in_package = false;
-    for line in contents.lines() {
-        let trimmed = line.trim();
-        if trimmed == "[package]" {
-            in_package = true;
-            continue;
-        }
-        if trimmed.starts_with('[') {
-            in_package = false;
-            continue;
-        }
-        if in_package && trimmed.starts_with("name") {
-            if let Some((_, rhs)) = trimmed.split_once('=') {
-                return Some(rhs.trim().trim_matches('"').to_string());
-            }
-        }
-    }
-    None
+    read_manifest(dir)?.package.map(|p| p.name)
 }
 
 /// Walk up from cwd looking for the nearest `Cargo.toml` with `[package].name`.
@@ -143,4 +166,60 @@ pub fn unit_hashes(repo_root: &Path, g: &BuildGraph) -> HashMap<String, OwnHash>
         }
     }
     own
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn write_member(root: &Path, rel: &str, name: &str) {
+        let dir = root.join(rel);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("Cargo.toml"),
+            format!("[package]\nname = \"{name}\"\nversion = \"0.0.0\"\n"),
+        )
+        .unwrap();
+    }
+
+    fn tmpdir() -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let d = std::env::temp_dir().join(format!("bob-ws-test-{}-{nanos}", std::process::id()));
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Covers our integration logic, not TOML parsing: glob expansion,
+    /// literal entries, skipping glob hits without a manifest, and the
+    /// package-name → relative-path mapping.
+    #[test]
+    fn workspace_members_glob_and_literal() {
+        let root = tmpdir();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\", \"tools/standalone\"]\n",
+        )
+        .unwrap();
+        write_member(&root, "crates/a", "alpha");
+        write_member(&root, "crates/b", "beta");
+        write_member(&root, "crates/b/nested", "nope"); // `*` must not cross `/`
+        write_member(&root, "tools/standalone", "standalone");
+        // glob hit without a Cargo.toml — must be skipped
+        fs::create_dir_all(root.join("crates/ignored")).unwrap();
+
+        let m = workspace_members(&root).unwrap();
+        assert_eq!(m.get("alpha"), Some(&PathBuf::from("crates/a")));
+        assert_eq!(m.get("beta"), Some(&PathBuf::from("crates/b")));
+        assert_eq!(
+            m.get("standalone"),
+            Some(&PathBuf::from("tools/standalone"))
+        );
+        assert!(!m.contains_key("nope"));
+        assert_eq!(m.len(), 3);
+        let _ = fs::remove_dir_all(&root);
+    }
 }
