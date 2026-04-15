@@ -67,9 +67,10 @@ exec 3>&1
 
 echo "__READY__"
 
-while IFS= read -r line; do
-    # line format: <script_path> <stdout_file> <stderr_file>
-    read -r script_path stdout_file stderr_file <<< "$line"
+# One path per line so spaces in $XDG_CACHE_HOME don't break field splitting.
+while IFS= read -r script_path; do
+    IFS= read -r stdout_file
+    IFS= read -r stderr_file
     ( source "$script_path" ) > "$stdout_file" 2> "$stderr_file" 3>&3
     echo "__DONE__ $?"
 done
@@ -136,7 +137,7 @@ done
 
         writeln!(
             stdin,
-            "{} {} {}",
+            "{}\n{}\n{}",
             script_path.display(),
             stdout_file.display(),
             stderr_file.display(),
