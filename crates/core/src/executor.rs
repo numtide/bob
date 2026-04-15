@@ -227,13 +227,12 @@ dumpVars() { :; }
 showPhaseHeader() { :; }
 showPhaseFooter() { :; }
 
-_ms() { read _s _ < /proc/uptime; echo "${_s/./}"; }
-_t0=$(_ms)
+_t0=${EPOCHREALTIME/./}
 set +e
 genericBuild
 rc=$?
-_t1=$(_ms)
-echo "__TIMING__ phases=$((_t1-_t0))0ms" >&2
+_t1=${EPOCHREALTIME/./}
+echo "__TIMING__ phases=$(( (_t1-_t0)/1000 ))ms" >&2
 exit $rc
 "#,
     );
