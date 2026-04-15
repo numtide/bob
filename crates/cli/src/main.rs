@@ -129,6 +129,16 @@ fn is_unit(d: &bob_core::Derivation) -> bool {
     BACKENDS.iter().any(|b| b.is_unit(d))
 }
 
+/// Stable identifier for the `is_unit` predicate, mixed into the graph-cache
+/// key so adding/removing a backend invalidates cached graphs.
+fn predicate_key() -> String {
+    BACKENDS
+        .iter()
+        .map(|b| b.id())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn cmd_build(args: &[String]) {
     if args.is_empty() {
         eprintln!("usage: bob build [-j N] [--repo-root <path>] <target>...");
@@ -180,8 +190,9 @@ fn cmd_build(args: &[String]) {
     }
 
     let drv_paths: Vec<String> = resolve_results.iter().map(|r| r.drv_path.clone()).collect();
-    let g = graph::BuildGraph::from_roots_cached(&drv_paths, cache.root(), is_unit)
-        .expect("building graph");
+    let g =
+        graph::BuildGraph::from_roots_cached(&drv_paths, cache.root(), &predicate_key(), is_unit)
+            .expect("building graph");
 
     // Realize any missing source tarballs / build inputs
     g.realize_inputs().expect("realizing inputs");

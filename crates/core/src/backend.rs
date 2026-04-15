@@ -50,9 +50,9 @@ pub struct BuildContext<'a> {
 }
 
 pub trait Backend: Send + Sync {
-    /// Backend identifier. Used to tag `UnitNode`s once multiple backends can
-    /// coexist in one graph; with a single backend nothing reads it yet.
-    #[allow(dead_code)]
+    /// Backend identifier. Mixed into the graph-cache key (the unit/boundary
+    /// partition depends on which backends are registered) and intended to
+    /// tag `UnitNode`s once multiple backends coexist in one graph.
     fn id(&self) -> &'static str;
 
     // ── graph ──────────────────────────────────────────────────────────────

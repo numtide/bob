@@ -33,14 +33,28 @@ pub struct BuildGraph {
 
 impl BuildGraph {
     /// Build the graph, using a cached serialization when available.
-    /// The cache key is blake3 of the sorted root drv paths — if the
-    /// roots haven't changed (same nix eval), the graph is identical.
+    ///
+    /// The cache key is blake3 of the sorted root drv paths plus
+    /// `predicate_key`. The graph depends on `is_unit` (it decides which
+    /// drvs are nodes vs boundary inputs), so callers must supply a stable
+    /// identifier for their predicate — typically the set of registered
+    /// backend ids — or a stale graph from before a backend was added would
+    /// be served on the same roots. The bob version is mixed in too so
+    /// intra-backend `is_unit` changes don't need a manual bump.
     pub fn from_roots_cached(
         root_drv_paths: &[String],
         cache_dir: &Path,
+        predicate_key: &str,
         is_unit: impl Fn(&Derivation) -> bool,
     ) -> Result<Self, String> {
         let mut hasher = blake3::Hasher::new();
+        // bob-core's own package version (Cargo-the-build-system, not the
+        // Rust language backend) — cheap proxy for "the is_unit logic may
+        // have changed since this cache was written".
+        hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
+        hasher.update(b"\0");
+        hasher.update(predicate_key.as_bytes());
+        hasher.update(b"\0");
         let mut sorted = root_drv_paths.to_vec();
         sorted.sort();
         for p in &sorted {
