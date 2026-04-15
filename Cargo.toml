@@ -1,14 +1,20 @@
-[package]
-name = "bob"
-description = "Bob the Builder — fast incremental builds on top of Nix"
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.85"
 license = "MIT"
 repository = "https://github.com/numtide/bob"
 
-[workspace]
-
-[dependencies]
+[workspace.dependencies]
 blake3 = "1"
+glob = "0.3"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = { version = "1", default-features = false, features = ["parse", "serde", "std"] }
 libc = "0.2"
+bob-core = { path = "crates/core" }
+bob-rust = { path = "crates/rust" }

@@ -238,7 +238,7 @@ impl Derivation {
 
         // With __structuredAttrs, individual env vars are packed into a
         // single __json blob. Unpack them so the rest of bob can
-        // access fields uniformly via env.get("crateName") etc.
+        // access fields uniformly via env.get("name") etc.
         let env = Self::unpack_structured_attrs(env);
 
         Ok(Derivation {
@@ -329,51 +329,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_real_drv_from_store() {
-        // Try parsing the actual drv file we instantiated earlier
-        let path = "/nix/store/8lqbka6bfivhj53a2m65vnm6z03rn56v-rust_hello-0.1.0.drv";
-        if !std::path::Path::new(path).exists() {
-            eprintln!("skipping: {path} not found");
-            return;
-        }
-        let contents = std::fs::read(path).unwrap();
-        let drv = Derivation::parse(&contents).unwrap();
-
-        assert_eq!(drv.platform, "x86_64-linux");
-        assert!(drv.builder.contains("bash"));
-        assert!(drv.outputs.contains_key("out"));
-        assert!(drv.outputs.contains_key("lib"));
-        assert!(drv.env.contains_key("buildPhase"));
-        assert!(drv.env.contains_key("configurePhase"));
-        assert!(drv.env.contains_key("installPhase"));
-        assert_eq!(drv.env["crateName"], "hello");
-    }
-
-    #[test]
-    fn parse_drv_with_deps() {
-        let path = "/nix/store/ps4wmxcnwk3sx6177pn0rwbr2ix7sps4-rust_hello-0.1.0.drv";
-        if !std::path::Path::new(path).exists() {
-            eprintln!("skipping: {path} not found");
-            return;
-        }
-        let contents = std::fs::read(path).unwrap();
-        let drv = Derivation::parse(&contents).unwrap();
-
-        // Should have serde as a dependency
-        assert!(
-            drv.env
-                .get("completeDeps")
-                .is_some_and(|v| v.contains("serde")),
-            "expected completeDeps to reference serde"
-        );
-        // buildPhase should have --extern serde=...
-        assert!(
-            drv.env["buildPhase"].contains("--extern serde="),
-            "expected buildPhase to have --extern serde"
-        );
-    }
-
-    #[test]
     fn parse_string_escapes() {
         let input = br#"Derive([("out","/nix/store/x-test","","")],[],["/nix/store/src"],"x86_64-linux","/bin/bash",[],[("script","echo \"hello\nworld\ttab\\done\"")])"#;
         let drv = Derivation::parse(input).unwrap();
@@ -382,8 +337,10 @@ mod tests {
 
     #[test]
     fn unpack_structured_attrs() {
-        // Simulate a __structuredAttrs drv where env only has __json + outputs
-        let json = r#"{"crateName":"foo","crateVersion":"1.0.0","completeDeps":["/nix/store/a","/nix/store/b"],"release":true,"codegenUnits":16,"configurePhase":"build-rust-crate configure"}"#;
+        // Simulate a __structuredAttrs drv where env only has __json + outputs.
+        // Key names are arbitrary — we're testing the type-flattening, not any
+        // particular builder's schema.
+        let json = r#"{"name":"foo","version":"1.0.0","deps":["/nix/store/a","/nix/store/b"],"release":true,"jobs":16,"configurePhase":"runHook preConfigure"}"#;
         let aterm = format!(
             "Derive([(\"out\",\"/nix/store/x-foo\",\"\",\"\")],[],[\"/nix/store/src\"],\"x86_64-linux\",\"/bin/bash\",[\"-e\",\"build\"],[(\"__json\",\"{}\"),(\"out\",\"/nix/store/x-foo\")])",
             json.replace('\\', "\\\\").replace('"', "\\\"")
@@ -391,14 +348,14 @@ mod tests {
         let drv = Derivation::parse(aterm.as_bytes()).unwrap();
 
         assert!(drv.is_structured_attrs());
-        assert_eq!(drv.env["crateName"], "foo");
-        assert_eq!(drv.env["crateVersion"], "1.0.0");
+        assert_eq!(drv.env["name"], "foo");
+        assert_eq!(drv.env["version"], "1.0.0");
         // Lists of strings should be space-separated
-        assert_eq!(drv.env["completeDeps"], "/nix/store/a /nix/store/b");
+        assert_eq!(drv.env["deps"], "/nix/store/a /nix/store/b");
         // Booleans: true → "1"
         assert_eq!(drv.env["release"], "1");
         // Numbers
-        assert_eq!(drv.env["codegenUnits"], "16");
+        assert_eq!(drv.env["jobs"], "16");
         // out should not be overwritten by __json unpacking
         assert_eq!(drv.env["out"], "/nix/store/x-foo");
     }

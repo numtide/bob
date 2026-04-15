@@ -61,6 +61,37 @@ All state lives under `$XDG_CACHE_HOME/bob/`:
 - `eval/` — cached member → drv mappings
 - `tmp/`, `rmeta/`, `build/` — in-flight state
 
+## Crate layout
+
+```
+crates/
+├── core/   bob-core  — language-agnostic .drv replay engine: ATerm parser,
+│                     unit DAG, content-addressed cache, path rewriter,
+│                     persistent stdenv workers, .attrs.{json,sh} emission,
+│                     two-tier (early-signal/done) scheduler, Backend trait
+├── rust/   bob-rust  — Rust backend: buildRustCrate/cargo-nix-plugin drvs,
+│                     rmeta pipelining via the __rustc-wrap shim,
+│                     -C incremental injection, Cargo workspace introspection
+└── cli/    bob       — the binary; registers backends and wires the CLI
+```
+
+## Adding a backend
+
+Implement `bob_core::Backend` in a new `crates/<lang>/` crate and append it
+to `BACKENDS` in `crates/cli/src/main.rs`. The minimum is:
+
+- `is_unit(drv)` — e.g. `drv.env.contains_key("goPackagePath")`
+- `unit_name(drv)` — progress display
+- `resolve_attr(target, root)` — attr path under `(import bob.nix {})`
+- `lock_hash(root)` — e.g. `blake3(go.sum)`
+- `build_script_hooks(ctx)` — e.g. `export GOCACHE=…`
+- `output_populated(tmp, drv)`
+
+`pipeline()` and `dispatch_internal()` default to no-ops; backends without
+an early-artifact analogue (Go) get correct done-gated scheduling for free.
+A `core-leakage` flake check enforces that `bob-core` stays free of
+backend-specific identifiers.
+
 ## Limitations
 
 - Outputs are not registered in the Nix store — downstream Nix consumers can't use them. Use `nix-build` for that.

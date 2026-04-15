@@ -1,18 +1,17 @@
-//! Parallel build scheduler with rmeta pipelining.
+//! Parallel build scheduler with optional mid-build pipelining.
 //!
-//! Executes crate builds in parallel, respecting the dependency DAG.
-//! For lib→lib edges, dependents start as soon as the upstream's fat rmeta
-//! (from `--emit=metadata,link`, contains MIR) is written, not when the rlib
-//! is done. proc-macro deps and deps with build.rs (which emit `link`/`env`
-//! files that downstream's configurePhase reads) gate on full completion.
+//! Executes unit builds in parallel, respecting the dependency DAG. Each
+//! dep→dependent edge is classified by the backend's `PipelinePolicy` as
+//! either:
+//!   - **early-signal**: dependent may start once the dep emits
+//!     `__META_READY__` on fd 3 (e.g. Rust rmeta written), or
+//!   - **done**: dependent waits for full commit (e.g. proc-macro `.so`,
+//!     `links` crates whose `lib/{link,env}` are read by downstream's
+//!     configurePhase, or any backend without an early-artifact analogue).
 //!
-//! Mechanism:
-//! - Worker threads pull from `ready`, build, and on completion decrement
-//!   `pending_done` counters of dependents.
-//! - The rustc wrapper writes `__META_READY__ <dir>` to fd 3 (the worker's
-//!   saved stdout) the moment rustc emits the fat rmeta. The worker's reader
-//!   dispatches that to an in-process callback that decrements `pending_rmeta`.
-//! - A crate becomes ready when both counters hit zero.
+//! Worker threads pull from `ready`, build, and on completion decrement
+//! dependents' `pending_done`. The fd-3 callback decrements `pending_early`.
+//! A unit becomes ready when both counters hit zero.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -23,48 +22,11 @@ use std::sync::Condvar;
 use std::sync::Mutex;
 use std::thread;
 
+use crate::backend::{Backend, BuildContext};
 use crate::cache::ArtifactCache;
-use crate::drv::Derivation;
-use crate::executor::SourceOverride;
-use crate::executor::{self, PipelineConfig};
-use crate::graph::BuildGraph;
+use crate::executor::{self, SourceOverride};
+use crate::graph::{BuildGraph, UnitNode};
 use crate::progress::Progress;
-
-/// A dep is "pipelineable" if dependents can start once its rmeta is ready,
-/// without waiting for the full build. That requires:
-///   - crateType is `lib` (proc-macro emits a .so that must be loaded;
-///     cdylib/bin link the world)
-///   - no `links` key (→ `crateLinks` env): such crates' build.rs writes
-///     `lib/link` and `lib/env` (DEP_<links>_* vars) that downstream's
-///     configurePhase reads BEFORE rustc starts. build.rs without `links`
-///     (proc-macro2, anyhow, ...) only sets cfg flags for the crate ITSELF,
-///     so dependents don't need to wait.
-///
-/// build.rs presence itself can't be detected statically — buildRustCrate
-/// auto-detects it after unpack — so `crateLinks` is the only reliable signal
-/// for "dependents need my full output".
-fn is_pipelineable(drv: &Derivation) -> bool {
-    let ct = drv.env.get("crateType").map(String::as_str).unwrap_or("");
-    let has_links = drv
-        .env
-        .get("crateLinks")
-        .map(|s| !s.is_empty())
-        .unwrap_or(false);
-    // crateType is space-separated; "lib cdylib" / "rlib" both produce a
-    // usable rmeta (the cdylib half needs upstream rlibs, but that's handled
-    // by the wrapper's poll-for-done on the IN side). proc-macro never does.
-    let emits_lib = ct.split_whitespace().any(|t| t == "lib" || t == "rlib");
-    emits_lib && !has_links
-}
-
-/// Predict the rlib/rmeta filename a crate will produce:
-/// `lib{libName}-{metadata}.{ext}`. buildRustCrate normalizes libName so the
-/// rlib uses underscores; the metadata hash is fixed at eval time.
-fn lib_filename(drv: &Derivation, ext: &str) -> Option<String> {
-    let lib_name = drv.env.get("libName")?.replace('-', "_");
-    let metadata = drv.env.get("metadata")?;
-    Some(format!("lib{lib_name}-{metadata}.{ext}"))
-}
 
 pub struct SchedulerResult {
     pub failed: usize,
@@ -73,11 +35,11 @@ pub struct SchedulerResult {
 struct SharedState {
     ready: Vec<String>,
     /// Count of deps whose rmeta we're waiting on (pipelineable deps).
-    pending_rmeta: HashMap<String, usize>,
+    pending_early: HashMap<String, usize>,
     /// Count of deps whose full build we're waiting on (proc-macro/build.rs).
     pending_done: HashMap<String, usize>,
     /// dep → dependents waiting on its rmeta.
-    rmeta_dependents: HashMap<String, Vec<String>>,
+    early_dependents: HashMap<String, Vec<String>>,
     /// dep → dependents waiting on its full completion.
     done_dependents: HashMap<String, Vec<String>>,
     /// store-output-path → cache/tmp path. Populated for cached crates up
@@ -85,11 +47,10 @@ struct SharedState {
     /// tmp/<key>/lib so downstream can read the early rmeta).
     output_map: BTreeMap<String, PathBuf>,
     /// drv_paths whose rmeta has been signalled. The fd-3 signal and the
-    /// post-success catch-up both call `fire_rmeta`; this set guarantees
+    /// post-success catch-up both call `fire_early`; this set guarantees
     /// idempotence so dependents are decremented exactly once.
-    rmeta_fired: HashSet<String>,
+    early_fired: HashSet<String>,
     succeeded: usize,
-    cached: usize,
     failed: usize,
     abort: bool,
     in_flight: usize,
@@ -97,23 +58,23 @@ struct SharedState {
 
 impl SharedState {
     fn maybe_ready(&mut self, drv: &str) {
-        if self.pending_rmeta.get(drv).copied() == Some(0)
+        if self.pending_early.get(drv).copied() == Some(0)
             && self.pending_done.get(drv).copied() == Some(0)
         {
             // Guard against double-push: remove from pending maps.
-            self.pending_rmeta.remove(drv);
+            self.pending_early.remove(drv);
             self.pending_done.remove(drv);
             self.ready.push(drv.to_string());
         }
     }
 
-    fn fire_rmeta(&mut self, dep: &str) {
-        if !self.rmeta_fired.insert(dep.to_string()) {
+    fn fire_early(&mut self, dep: &str) {
+        if !self.early_fired.insert(dep.to_string()) {
             return;
         }
-        if let Some(ds) = self.rmeta_dependents.remove(dep) {
+        if let Some(ds) = self.early_dependents.remove(dep) {
             for d in ds {
-                if let Some(c) = self.pending_rmeta.get_mut(&d) {
+                if let Some(c) = self.pending_early.get_mut(&d) {
                     *c -= 1;
                 }
                 self.maybe_ready(&d);
@@ -128,42 +89,28 @@ impl SharedState {
     }
 }
 
-/// A `lib cdylib` crate's cached artifact may have been committed without the
-/// `.so` (link pass skipped when it was a transitive dep). When it's the root
-/// target, the `.so` IS the product, so an rlib-only artifact is insufficient.
-fn needs_link_output(drv: &Derivation) -> bool {
-    drv.env
-        .get("crateType")
-        .map(|ct| {
-            ct.split_whitespace()
-                .any(|t| matches!(t, "cdylib" | "staticlib"))
-        })
-        .unwrap_or(false)
-}
-
-fn artifact_has_link_output(dir: &std::path::Path) -> bool {
-    std::fs::read_dir(dir.join("lib").join("lib"))
-        .map(|d| {
-            d.flatten().any(|e| {
-                let n = e.file_name();
-                let n = n.to_string_lossy();
-                n.ends_with(".so") || n.ends_with(".a") || n.ends_with(".dylib")
-            })
-        })
-        .unwrap_or(false)
-}
-
 pub fn run_parallel(
     graph: &BuildGraph,
     cache: &ArtifactCache,
     jobs: usize,
-    bash: &str,
-    stdenv_path: &str,
+    backend: &dyn Backend,
     overrides: &HashMap<String, SourceOverride>,
     roots: &[String],
 ) -> SchedulerResult {
     let roots: HashSet<&str> = roots.iter().map(String::as_str).collect();
     let start = std::time::Instant::now();
+    let pl = backend.pipeline();
+    let self_exe = std::env::current_exe().expect("resolving self exe");
+
+    // Worker pool config from any unit's drv — they all share stdenv/builder.
+    let first_drv = graph.nodes.values().next().expect("empty graph");
+    let bash = first_drv.drv.builder.clone();
+    let stdenv_path = first_drv
+        .drv
+        .env
+        .get("stdenv")
+        .expect("drv missing stdenv")
+        .clone();
 
     // Override-aware helpers. Any drv with a SourceOverride uses a composite
     // cache key (drv_path + effective source hash); plain `is_cached(drv)` would
@@ -175,14 +122,17 @@ pub fn run_parallel(
         }
     };
     let artifact_dir = |drv: &str| cache.artifact_dir_by_key(&key_for(drv));
-    let is_cached = |drv: &str, node: &crate::graph::CrateNode| -> bool {
+    let is_cached = |drv: &str, node: &UnitNode| -> bool {
         if !cache.is_cached_key(&key_for(drv)) {
             return false;
         }
-        // Root cdylib targets must have the .so; a prior non-root run may have
-        // committed rlib-only. Absence isn't an error — just means "rebuild".
-        if roots.contains(drv) && needs_link_output(&node.drv) {
-            return artifact_has_link_output(&artifact_dir(drv));
+        // Root targets may have a stricter "sufficient" test than transitive
+        // deps (e.g. Rust cdylib roots need the .so; a prior non-root run may
+        // have committed rlib-only). Absence is just "rebuild", not an error.
+        if roots.contains(drv) {
+            return pl.is_none_or(|p| {
+                p.cached_artifact_sufficient_as_root(&node.drv, &artifact_dir(drv))
+            });
         }
         true
     };
@@ -191,12 +141,12 @@ pub fn run_parallel(
     let pipelineable: HashMap<String, bool> = graph
         .nodes
         .iter()
-        .map(|(k, n)| (k.clone(), is_pipelineable(&n.drv)))
+        .map(|(k, n)| (k.clone(), pl.is_some_and(|p| p.is_pipelineable(&n.drv))))
         .collect();
 
-    let mut pending_rmeta: HashMap<String, usize> = HashMap::new();
+    let mut pending_early: HashMap<String, usize> = HashMap::new();
     let mut pending_done: HashMap<String, usize> = HashMap::new();
-    let mut rmeta_dependents: HashMap<String, Vec<String>> = HashMap::new();
+    let mut early_dependents: HashMap<String, Vec<String>> = HashMap::new();
     let mut done_dependents: HashMap<String, Vec<String>> = HashMap::new();
     let mut output_map: BTreeMap<String, PathBuf> = BTreeMap::new();
     let mut ready: Vec<String> = Vec::new();
@@ -215,17 +165,17 @@ pub fn run_parallel(
         to_build += 1;
 
         let uncached_deps: Vec<&String> = node
-            .crate_deps
+            .unit_deps
             .iter()
             .filter(|dep| !is_cached(dep, &graph.nodes[dep.as_str()]))
             .collect();
 
-        let mut n_rmeta = 0usize;
+        let mut n_early = 0usize;
         let mut n_done = 0usize;
         for dep in &uncached_deps {
             if *pipelineable.get(dep.as_str()).unwrap_or(&false) {
-                n_rmeta += 1;
-                rmeta_dependents
+                n_early += 1;
+                early_dependents
                     .entry((*dep).clone())
                     .or_default()
                     .push(drv_path.clone());
@@ -237,10 +187,10 @@ pub fn run_parallel(
                     .push(drv_path.clone());
             }
         }
-        pending_rmeta.insert(drv_path.clone(), n_rmeta);
+        pending_early.insert(drv_path.clone(), n_early);
         pending_done.insert(drv_path.clone(), n_done);
 
-        if n_rmeta == 0 && n_done == 0 {
+        if n_early == 0 && n_done == 0 {
             ready.push(drv_path.clone());
         }
     }
@@ -254,14 +204,13 @@ pub fn run_parallel(
     let state = Arc::new((
         Mutex::new(SharedState {
             ready,
-            pending_rmeta,
+            pending_early,
             pending_done,
-            rmeta_dependents,
+            early_dependents,
             done_dependents,
             output_map,
-            rmeta_fired: HashSet::new(),
+            early_fired: HashSet::new(),
             succeeded: 0,
-            cached: 0,
             failed: 0,
             abort: false,
             in_flight: 0,
@@ -275,6 +224,9 @@ pub fn run_parallel(
             let progress = Arc::clone(&progress);
             let tmp_dir = &tmp_dir;
             let roots = &roots;
+            let bash = &bash;
+            let stdenv_path = &stdenv_path;
+            let self_exe = &self_exe;
             s.spawn(move || {
                 let mut worker =
                     crate::worker::Worker::spawn(bash, stdenv_path).expect("spawning worker");
@@ -282,6 +234,8 @@ pub fn run_parallel(
                     &state,
                     &graph.nodes,
                     cache,
+                    backend,
+                    self_exe,
                     &mut worker,
                     &progress,
                     overrides,
@@ -294,7 +248,7 @@ pub fn run_parallel(
 
     let s = state.0.lock().unwrap();
 
-    progress.summary(s.succeeded, cached + s.cached, s.failed, start.elapsed());
+    progress.summary(s.succeeded, cached, s.failed, start.elapsed());
 
     SchedulerResult { failed: s.failed }
 }
@@ -302,8 +256,10 @@ pub fn run_parallel(
 #[allow(clippy::too_many_arguments)]
 fn worker_loop(
     state: &(Mutex<SharedState>, Condvar),
-    nodes: &BTreeMap<String, crate::graph::CrateNode>,
+    nodes: &BTreeMap<String, UnitNode>,
     cache: &ArtifactCache,
+    backend: &dyn Backend,
+    self_exe: &std::path::Path,
     worker: &mut crate::worker::Worker,
     progress: &Progress,
     overrides: &HashMap<String, SourceOverride>,
@@ -355,7 +311,7 @@ fn worker_loop(
             // symlinks each in-flight dep's early rmeta into target/deps and
             // re-resolves missing externs by metadata hash.
             let mut dep_map: BTreeMap<String, PathBuf> = BTreeMap::new();
-            for dep_drv in &node.crate_deps {
+            for dep_drv in &node.unit_deps {
                 let Some(dep_node) = nodes.get(dep_drv) else {
                     continue;
                 };
@@ -370,34 +326,28 @@ fn worker_loop(
         };
 
         let node = &nodes[&drv_path];
-        let crate_name = node
-            .drv
-            .env
-            .get("crateName")
-            .cloned()
-            .unwrap_or_else(|| "unknown".into());
-
-        progress.start(&crate_name);
+        let unit_name = backend.unit_name(&node.drv).into_owned();
+        progress.start(&unit_name);
 
         let rewriter = executor::make_rewriter(&node.drv, &dep_map);
         let src_ov = overrides.get(&drv_path);
-        let pl = PipelineConfig {
-            expected_rmeta: lib_filename(&node.drv, "rmeta").unwrap_or_default(),
-            // Only the explicit build targets need their cdylib/staticlib
-            // output; for transitive deps the rlib is all anyone reads.
-            skip_link_pass: !roots.contains(drv_path.as_str()),
-        };
-        let result = executor::build_crate_with_worker_signaled(
-            &drv_path,
-            &node.drv,
-            cache,
+        let tmp = tmp_dir(&drv_path);
+        let result = executor::build_unit(
+            BuildContext {
+                drv_path: &drv_path,
+                drv: &node.drv,
+                tmp: &tmp,
+                cache,
+                is_root: roots.contains(drv_path.as_str()),
+                self_exe,
+            },
+            backend,
             &rewriter,
             worker,
             src_ov,
-            &pl,
-            |_rmeta_dir| {
+            |_early_dir| {
                 let mut s = lock.lock().unwrap();
-                s.fire_rmeta(&drv_path);
+                s.fire_early(&drv_path);
                 cvar.notify_all();
             },
         );
@@ -409,7 +359,7 @@ fn worker_loop(
             match result {
                 Ok(ref r) if r.success => {
                     s.succeeded += 1;
-                    progress.finish(&crate_name, r.duration);
+                    progress.finish(&unit_name, r.duration);
 
                     // output_map already points at tmp/<key>/ (registered when
                     // we started); commit hardlink-copies tmp→artifacts but
@@ -420,8 +370,8 @@ fn worker_loop(
                     // Catch-up for crates that never signalled rmeta (proc-
                     // macros, bin-only, build.rs probe with no lib target,
                     // crates with `links`): unblock rmeta-waiters now.
-                    // `rmeta_fired` makes this idempotent if fd-3 already fired.
-                    s.fire_rmeta(&drv_path);
+                    // `early_fired` makes this idempotent if fd-3 already fired.
+                    s.fire_early(&drv_path);
 
                     if let Some(ds) = s.done_dependents.remove(&drv_path) {
                         for d in ds {
@@ -435,12 +385,12 @@ fn worker_loop(
                 Ok(ref r) => {
                     s.failed += 1;
                     s.abort = true;
-                    progress.fail(&crate_name, &r.stdout, &r.stderr);
+                    progress.fail(&unit_name, &r.stdout, &r.stderr);
                 }
                 Err(e) => {
                     s.failed += 1;
                     s.abort = true;
-                    progress.fail(&crate_name, "", &e);
+                    progress.fail(&unit_name, "", &e);
                 }
             }
 

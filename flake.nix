@@ -85,6 +85,18 @@
               cargo fmt --check
               touch $out
             '';
+        # bob-core must stay language-agnostic. Fail if any Rust-backend
+        # identifier appears outside of doc comments.
+        core-leakage = pkgs.runCommand "bob-core-leakage" { nativeBuildInputs = [ pkgs.ripgrep ]; } ''
+          cd ${./crates/core/src}
+          if rg --no-heading --line-number --pcre2 \
+               '^(?!\s*//).*\b(crateName|crateType|crateLinks|crateVersion|libName|rustc|rlib|EXTRA_RUSTC_FLAGS|__rustc-wrap|buildRustCrate|Cargo\.(toml|lock))\b' \
+               . ; then
+            echo "error: Rust-backend identifiers found in bob-core (see above)" >&2
+            exit 1
+          fi
+          touch $out
+        '';
       });
 
       formatter = forAllSystems (pkgs: pkgs.nixfmt-tree);
