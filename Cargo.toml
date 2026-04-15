@@ -14,7 +14,7 @@ blake3 = "1"
 glob = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.9"
+toml = { version = "0.9", default-features = false, features = ["parse", "serde", "std"] }
 libc = "0.2"
 bob-core = { path = "crates/core" }
 bob-rust = { path = "crates/rust" }
