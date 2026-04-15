@@ -108,12 +108,11 @@ pub trait Backend: Send + Sync {
 
     // ── internal subcommands ───────────────────────────────────────────────
 
-    /// Handle `bob __<x> …` re-entries from wrapper shims. Return `true` only
-    /// if `cmd` is ours — the impl must `process::exit` itself in that case
-    /// (the cli `unreachable!()`s on `true`). Return `false` to pass.
-    fn dispatch_internal(&self, _cmd: &str, _args: &[String]) -> bool {
-        false
-    }
+    /// Handle `bob __<x> …` re-entries from wrapper shims. If `cmd` belongs
+    /// to this backend, run it and `process::exit`; otherwise return so the
+    /// cli can try the next backend. (No useful return value: a claimed
+    /// command never returns.)
+    fn dispatch_internal(&self, _cmd: &str, _args: &[String]) {}
 }
 
 /// Per-backend pipelining policy. The scheduler classifies each dep→dependent

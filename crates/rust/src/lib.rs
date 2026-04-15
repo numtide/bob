@@ -67,10 +67,9 @@ impl Backend for RustBackend {
         Some(&PIPELINE)
     }
 
-    fn dispatch_internal(&self, cmd: &str, args: &[String]) -> bool {
+    fn dispatch_internal(&self, cmd: &str, args: &[String]) {
         if cmd == "__rustc-wrap" {
             rustc_wrap::main(args);
         }
-        false
     }
 }

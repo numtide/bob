@@ -25,12 +25,12 @@ fn main() {
 
     match args[1].as_str() {
         // Internal wrapper-shim re-entries (`bob __<backend>-wrap …`).
-        // Dispatched first — hot path, invoked once per compiler call.
+        // Dispatched first — hot path, invoked once per compiler call. A
+        // backend that claims `cmd` diverges via process::exit; if we fall
+        // through the loop, nobody claimed it.
         cmd if cmd.starts_with("__") => {
             for b in BACKENDS {
-                if b.dispatch_internal(cmd, &args[2..]) {
-                    unreachable!("dispatch_internal must exit when it returns true");
-                }
+                b.dispatch_internal(cmd, &args[2..]);
             }
             eprintln!("unknown internal command: {cmd}");
             std::process::exit(1);
