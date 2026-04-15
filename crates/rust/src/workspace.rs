@@ -11,9 +11,7 @@ use serde::Deserialize;
 
 #[derive(Deserialize)]
 struct Manifest {
-    #[serde(default)]
     package: Option<Package>,
-    #[serde(default)]
     workspace: Option<Workspace>,
 }
 
@@ -28,9 +26,11 @@ struct Workspace {
     members: Vec<String>,
 }
 
-fn read_manifest(dir: &Path) -> Option<Manifest> {
-    let s = std::fs::read_to_string(dir.join("Cargo.toml")).ok()?;
-    toml::from_str(&s).ok()
+fn read_manifest(dir: &Path) -> Result<Manifest, String> {
+    let path = dir.join("Cargo.toml");
+    let s =
+        std::fs::read_to_string(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    toml::from_str(&s).map_err(|e| format!("parsing {}: {e}", path.display()))
 }
 
 /// blake3 of `Cargo.lock` — gates the eval-cache (drv reuse is sound as long
@@ -44,8 +44,7 @@ pub fn lock_hash(repo_root: &Path) -> Result<String, String> {
 /// `package_name → relative_path` from the root `Cargo.toml`'s
 /// `[workspace].members`, with glob expansion (same `glob` crate Cargo uses).
 pub fn workspace_members(repo_root: &Path) -> Result<BTreeMap<String, PathBuf>, String> {
-    let entries = read_manifest(repo_root)
-        .ok_or_else(|| format!("reading/parsing {}/Cargo.toml", repo_root.display()))?
+    let entries = read_manifest(repo_root)?
         .workspace
         .map(|w| w.members)
         .unwrap_or_default();
@@ -90,9 +89,19 @@ fn expand_member(repo_root: &Path, entry: &str) -> Result<Vec<PathBuf>, String> 
     Ok(out)
 }
 
-/// `[package].name` from `dir/Cargo.toml`.
+/// `[package].name` from `dir/Cargo.toml`. Missing files return `None`
+/// silently (glob hits without a manifest, walking past the repo root in
+/// `detect_from_cwd`); malformed TOML is logged so a member doesn't quietly
+/// drop out of source-change tracking.
 pub fn read_package_name(dir: &Path) -> Option<String> {
-    read_manifest(dir)?.package.map(|p| p.name)
+    match read_manifest(dir) {
+        Ok(m) => m.package.map(|p| p.name),
+        Err(e) if dir.join("Cargo.toml").exists() => {
+            eprintln!("  warn: {e}");
+            None
+        }
+        Err(_) => None,
+    }
 }
 
 /// Walk up from cwd looking for the nearest `Cargo.toml` with `[package].name`.
