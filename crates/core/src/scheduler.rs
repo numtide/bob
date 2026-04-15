@@ -103,7 +103,12 @@ pub fn run_parallel(
     let self_exe = std::env::current_exe().expect("resolving self exe");
 
     // Worker pool config from any unit's drv — they all share stdenv/builder.
-    let first_drv = graph.nodes.values().next().expect("empty graph");
+    let Some(first_drv) = graph.nodes.values().next() else {
+        // from_roots() rejects missing/non-unit roots, so this only triggers
+        // when called with no roots at all.
+        Progress::new(0, 0).summary(0, 0, 0, start.elapsed());
+        return SchedulerResult { failed: 0 };
+    };
     let bash = first_drv.drv.builder.clone();
     let stdenv_path = first_drv
         .drv

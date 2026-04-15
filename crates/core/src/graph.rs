@@ -73,10 +73,18 @@ impl BuildGraph {
         Ok(g)
     }
 
+    /// On-disk graph cache format. Bump when `write_derivation` /
+    /// `save_cached` change shape so stale caches are rejected instead of
+    /// deserialising garbage.
+    const CACHE_MAGIC: &[u8; 4] = b"BOBG";
+    const CACHE_VERSION: u32 = 1;
+
     /// Serialize graph to a compact binary format.
     /// Stores parsed Derivation fields directly to avoid re-parsing ATerm.
     fn save_cached(&self, path: &Path) {
         let mut buf = Vec::with_capacity(64 * 1024);
+        buf.extend_from_slice(Self::CACHE_MAGIC);
+        buf.extend_from_slice(&Self::CACHE_VERSION.to_le_bytes());
         buf.extend_from_slice(&(self.nodes.len() as u32).to_le_bytes());
         for (drv_path, node) in &self.nodes {
             write_str(&mut buf, drv_path);
@@ -108,6 +116,14 @@ impl BuildGraph {
     fn load_cached(path: &Path) -> Option<Self> {
         let buf = std::fs::read(path).ok()?;
         let mut pos = 0;
+
+        if buf.get(..4)? != Self::CACHE_MAGIC {
+            return None;
+        }
+        pos += 4;
+        if read_u32(&buf, &mut pos)? != Self::CACHE_VERSION {
+            return None;
+        }
 
         let num_nodes = read_u32(&buf, &mut pos)?;
         let mut nodes = BTreeMap::new();
@@ -166,6 +182,7 @@ impl BuildGraph {
         root_drv_paths: &[String],
         is_unit: impl Fn(&Derivation) -> bool,
     ) -> Result<Self, String> {
+        let roots: HashSet<&str> = root_drv_paths.iter().map(String::as_str).collect();
         let mut nodes: BTreeMap<String, UnitNode> = BTreeMap::new();
         let mut queue: VecDeque<String> = root_drv_paths.iter().cloned().collect();
         let mut visited: HashSet<String> = HashSet::new();
@@ -174,10 +191,14 @@ impl BuildGraph {
             if !visited.insert(drv_path.clone()) {
                 continue;
             }
+            let is_root = roots.contains(drv_path.as_str());
 
             let drv_file = Path::new(&drv_path);
             if !drv_file.exists() {
-                // Not in store — skip (might be a fetchurl or other non-local drv)
+                if is_root {
+                    return Err(format!("root drv not found: {drv_path}"));
+                }
+                // Transitive input not in store — skip (fetchurl etc.).
                 continue;
             }
 
@@ -187,6 +208,9 @@ impl BuildGraph {
                 Derivation::parse(&contents).map_err(|e| format!("parsing {drv_path}: {e}"))?;
 
             if !is_unit(&drv) {
+                if is_root {
+                    return Err(format!("no backend recognises {drv_path} as a build unit"));
+                }
                 continue;
             }
 
