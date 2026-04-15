@@ -49,7 +49,7 @@ impl Backend for RustBackend {
 
     fn list_targets(&self, repo_root: &Path) -> Vec<String> {
         workspace::workspace_members(repo_root)
-            .map(|m| m.into_keys().collect())
+            .map(|m| m.keys().cloned().collect())
             .unwrap_or_default()
     }
 

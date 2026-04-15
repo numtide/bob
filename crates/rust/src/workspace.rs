@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use bob_core::resolve::EvalCache;
 use bob_core::{BuildGraph, OwnHash};
@@ -43,7 +44,32 @@ pub fn lock_hash(repo_root: &Path) -> Result<String, String> {
 
 /// `package_name → relative_path` from the root `Cargo.toml`'s
 /// `[workspace].members`, with glob expansion (same `glob` crate Cargo uses).
-pub fn workspace_members(repo_root: &Path) -> Result<BTreeMap<String, PathBuf>, String> {
+///
+/// Memoized per process: this is called from `resolve_attr`, `list_targets`
+/// and `unit_hashes` with the same `repo_root` on every `bob build`, and the
+/// toml parse + per-member manifest reads cost ~15ms on a 450-member
+/// workspace — noticeable on the no-op path. The result only changes when
+/// `Cargo.toml` is edited, which already invalidates the eval cache anyway.
+pub fn workspace_members(repo_root: &Path) -> Result<&'static BTreeMap<String, PathBuf>, String> {
+    type Memo = (PathBuf, Result<BTreeMap<String, PathBuf>, String>);
+    static CACHE: OnceLock<Memo> = OnceLock::new();
+    let (cached_root, result) = CACHE.get_or_init(|| {
+        (
+            repo_root.to_path_buf(),
+            compute_workspace_members(repo_root),
+        )
+    });
+    // bob never calls this with two different roots in one process, but
+    // assert it so a future refactor that does fails loudly instead of
+    // returning the wrong workspace.
+    debug_assert_eq!(
+        cached_root, repo_root,
+        "workspace_members memo keyed on first repo_root"
+    );
+    result.as_ref().map_err(String::clone)
+}
+
+fn compute_workspace_members(repo_root: &Path) -> Result<BTreeMap<String, PathBuf>, String> {
     let entries = read_manifest(repo_root)?
         .workspace
         .map(|w| w.members)
@@ -157,7 +183,7 @@ pub fn unit_hashes(repo_root: &Path, g: &BuildGraph) -> HashMap<String, OwnHash>
 
     let mut own: HashMap<String, OwnHash> = HashMap::new();
     if let Ok(members) = workspace_members(repo_root) {
-        for (name, rel) in &members {
+        for (name, rel) in members {
             if let Some(drv) = name_to_drv.get(name) {
                 match EvalCache::source_hash(repo_root, rel, &|n| n == "target") {
                     Ok(hash) => {
@@ -220,7 +246,9 @@ mod tests {
         // glob hit without a Cargo.toml — must be skipped
         fs::create_dir_all(root.join("crates/ignored")).unwrap();
 
-        let m = workspace_members(&root).unwrap();
+        // Bypass the process-global memo so this test's tmpdir doesn't
+        // collide with whichever repo_root another test cached first.
+        let m = compute_workspace_members(&root).unwrap();
         assert_eq!(m.get("alpha"), Some(&PathBuf::from("crates/a")));
         assert_eq!(m.get("beta"), Some(&PathBuf::from("crates/b")));
         assert_eq!(
