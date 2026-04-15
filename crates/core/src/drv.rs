@@ -93,25 +93,29 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parse a quoted string: `"..."` with escape handling.
+    /// Parse a quoted string: `"..."` with escape handling. ATerm is raw
+    /// bytes; we collect into a `Vec<u8>` and UTF-8 decode at the end so
+    /// multi-byte sequences round-trip (the previous `b as char` per byte
+    /// Latin-1-decoded them).
     fn parse_string(&mut self) -> Result<String, String> {
         self.expect_byte(b'"')?;
-        let mut result = String::new();
+        let mut buf: Vec<u8> = Vec::new();
         loop {
             match self.peek() {
                 None => return Err("unterminated string".into()),
                 Some(b'"') => {
                     self.advance(1);
-                    return Ok(result);
+                    return String::from_utf8(buf)
+                        .map_err(|e| format!("non-UTF-8 string at pos {}: {e}", self.pos));
                 }
                 Some(b'\\') => {
                     self.advance(1);
                     match self.peek() {
-                        Some(b'"') => result.push('"'),
-                        Some(b'\\') => result.push('\\'),
-                        Some(b'n') => result.push('\n'),
-                        Some(b'r') => result.push('\r'),
-                        Some(b't') => result.push('\t'),
+                        Some(b'"') => buf.push(b'"'),
+                        Some(b'\\') => buf.push(b'\\'),
+                        Some(b'n') => buf.push(b'\n'),
+                        Some(b'r') => buf.push(b'\r'),
+                        Some(b't') => buf.push(b'\t'),
                         Some(c) => {
                             return Err(format!(
                                 "unknown escape \\{} at pos {}",
@@ -123,7 +127,7 @@ impl<'a> Parser<'a> {
                     self.advance(1);
                 }
                 Some(b) => {
-                    result.push(b as char);
+                    buf.push(b);
                     self.advance(1);
                 }
             }
@@ -326,6 +330,15 @@ mod tests {
         assert_eq!(drv.outputs["out"].path, "/nix/store/aaaa-foo");
         assert_eq!(drv.platform, "x86_64-linux");
         assert_eq!(drv.builder, "/nix/store/bbbb-bash");
+    }
+
+    #[test]
+    fn parse_string_utf8() {
+        // “café →” is multi-byte UTF-8; the byte-wise `b as char` decoder
+        // turned it into mojibake. Round-trip must be exact.
+        let input = "Derive([(\"out\",\"/nix/store/x\",\"\",\"\")],[],[],\"x86_64-linux\",\"/bin/sh\",[],[(\"desc\",\"café → done\")])".as_bytes();
+        let drv = Derivation::parse(input).unwrap();
+        assert_eq!(drv.env["desc"], "café → done");
     }
 
     #[test]
