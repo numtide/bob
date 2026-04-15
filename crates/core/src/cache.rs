@@ -11,11 +11,17 @@
 //!       lib/    — corresponds to $lib
 //!     tmp/      — in-progress builds, renamed atomically on completion
 
+use std::fs::File;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
 pub struct ArtifactCache {
     root: PathBuf,
 }
+
+/// Exclusive lock on the cache root, released on drop. Prevents two
+/// concurrent `bob build` runs from tearing down each other's `tmp/<key>`.
+pub struct CacheLock(#[allow(dead_code)] File);
 
 impl Default for ArtifactCache {
     fn default() -> Self {
@@ -73,6 +79,32 @@ impl ArtifactCache {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Take an exclusive `flock` on `<root>/.lock`. Blocks until acquired;
+    /// returns a guard that releases on drop (via fd close).
+    pub fn lock_exclusive(&self) -> Result<CacheLock, String> {
+        std::fs::create_dir_all(&self.root).map_err(|e| format!("creating cache root: {e}"))?;
+        let path = self.root.join(".lock");
+        let f = File::options()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| format!("opening {}: {e}", path.display()))?;
+        // Non-blocking try first so we can print a hint before blocking.
+        let fd = f.as_raw_fd();
+        if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            eprintln!("  waiting for cache lock ({}) …", path.display());
+            if unsafe { libc::flock(fd, libc::LOCK_EX) } != 0 {
+                return Err(format!(
+                    "locking {}: {}",
+                    path.display(),
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
+        Ok(CacheLock(f))
     }
 
     /// Persistent per-unit incremental-compilation state. Unlike
