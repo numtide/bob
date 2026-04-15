@@ -1,5 +1,25 @@
 {
   "nodes": {
+    "cargo-nix-plugin": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1775898954,
+        "narHash": "sha256-4di90UfBpfxixhr+0eAcsCd+upFphr/VEiF5kS1d7AI=",
+        "owner": "Mic92",
+        "repo": "cargo-nix-plugin",
+        "rev": "9890e75a46f12ee098cd7d27b9eb65e5fe3f438a",
+        "type": "github"
+      },
+      "original": {
+        "owner": "Mic92",
+        "repo": "cargo-nix-plugin",
+        "type": "github"
+      }
+    },
     "devshell": {
       "inputs": {
         "nixpkgs": [
@@ -35,6 +55,7 @@
     },
     "root": {
       "inputs": {
+        "cargo-nix-plugin": "cargo-nix-plugin",
         "devshell": "devshell",
         "nixpkgs": "nixpkgs"
       }

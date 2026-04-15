@@ -8,6 +8,11 @@
       url = "github:numtide/devshell";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+
+    cargo-nix-plugin = {
+      url = "github:Mic92/cargo-nix-plugin";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
@@ -15,6 +20,7 @@
       self,
       nixpkgs,
       devshell,
+      cargo-nix-plugin,
     }:
     let
       systems = [
@@ -28,11 +34,35 @@
         nixpkgs.lib.genAttrs systems (
           system: f (nixpkgs.legacyPackages.${system}.extend devshell.overlays.default)
         );
+
+      # nix-instantiate with `builtins.resolveCargoWorkspace` available, for
+      # `BOB_NIX_INSTANTIATE`. The plugin ABI is tied to the exact Nix it was
+      # built against, so pair the 2.34 plugin with 2.34 nix from the same
+      # nixpkgs rather than whatever the host has. Only exposed where
+      # cargo-nix-plugin actually ships a build (no x86_64-darwin).
+      bobNixInstantiate =
+        pkgs:
+        let
+          system = pkgs.stdenv.hostPlatform.system;
+        in
+        nixpkgs.lib.optionalAttrs (cargo-nix-plugin.packages ? ${system}) {
+          bob-nix-instantiate = pkgs.writeShellScriptBin "nix-instantiate" ''
+            exec ${pkgs.nixVersions.nix_2_34}/bin/nix-instantiate \
+              --option plugin-files ${
+                cargo-nix-plugin.packages.${system}.cargo-nix-plugin-nix_2_34
+              }/lib/nix/plugins \
+              "$@"
+          '';
+        };
     in
     {
-      packages = forAllSystems (pkgs: {
-        inherit (import ./default.nix { inherit pkgs; }) bob default;
-      });
+      packages = forAllSystems (
+        pkgs:
+        {
+          inherit (import ./default.nix { inherit pkgs; }) bob default;
+        }
+        // bobNixInstantiate pkgs
+      );
 
       devShells = forAllSystems (pkgs: {
         default = pkgs.devshell.mkShell {
@@ -51,7 +81,11 @@
               name = "RUST_SRC_PATH";
               value = "${pkgs.rustPlatform.rustLibSrc}";
             }
-          ];
+          ]
+          ++ nixpkgs.lib.mapAttrsToList (_: drv: {
+            name = "BOB_NIX_INSTANTIATE";
+            value = "${drv}/bin/nix-instantiate";
+          }) (bobNixInstantiate pkgs);
           commands = [
             {
               name = "fmt";
