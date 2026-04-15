@@ -3,6 +3,7 @@ name = "bob"
 description = "Bob the Builder — fast incremental builds on top of Nix"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 

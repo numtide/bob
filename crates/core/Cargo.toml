@@ -3,6 +3,7 @@ name = "bob-core"
 description = "Language-agnostic Nix .drv replay engine for bob"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 

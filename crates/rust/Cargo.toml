@@ -3,6 +3,7 @@ name = "bob-rust"
 description = "Rust (buildRustCrate / cargo-nix-plugin) backend for bob"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
