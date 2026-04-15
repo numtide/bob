@@ -16,3 +16,24 @@ jobs:
       # Builds the `bob` package (buildRustPackage runs `cargo test` in
       # checkPhase) plus the fmt / core-leakage checks from flake.nix.
       - run: nix flake check --print-build-logs
+
+  # Self-host: build bob with bob. Runs outside the Nix sandbox so
+  # cargo-nix-plugin's lockfile resolver can hit the crates.io sparse index
+  # at eval time (not a FOD, so it can't run inside a flake check).
+  self-host:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: cachix/install-nix-action@v31
+      - name: Build bootstrap bob + plugin-loaded nix-instantiate
+        run: |
+          nix build --print-build-logs --out-link bootstrap \
+            .#bob .#bob-nix-instantiate
+      - name: bob build bob
+        run: |
+          export BOB_NIX_INSTANTIATE="$PWD/bootstrap-1/bin/nix-instantiate"
+          ./bootstrap/bin/bob build bob
+          # Smoke-test the self-built binary and check it agrees with the
+          # bootstrap (--help writes to stderr).
+          ./result/bin/bob --help
+          diff <(./bootstrap/bin/bob --help 2>&1) <(./result/bin/bob --help 2>&1)
