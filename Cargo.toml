@@ -2,6 +2,12 @@
 resolver = "2"
 members = ["crates/*"]
 
+[workspace.metadata.bob]
+# bob.nix reads flake.lock for the nixpkgs/cargo-nix-plugin pins, so a lock
+# bump must invalidate bob's nix-instantiate cache. bob.nix and Cargo.lock
+# are always tracked; list anything else bob.nix imports here.
+eval-inputs = ["flake.lock"]
+
 [workspace.package]
 version = "0.1.0"
 edition = "2021"

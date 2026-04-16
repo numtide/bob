@@ -25,6 +25,23 @@ struct Package {
 struct Workspace {
     #[serde(default)]
     members: Vec<String>,
+    #[serde(default)]
+    metadata: WorkspaceMetadata,
+}
+
+#[derive(Deserialize, Default)]
+struct WorkspaceMetadata {
+    #[serde(default)]
+    bob: BobMetadata,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+struct BobMetadata {
+    /// Extra paths (relative to Cargo.toml, globs allowed) whose contents
+    /// invalidate bob's nix-instantiate cache. See `lock_hash`.
+    #[serde(default)]
+    eval_inputs: Vec<String>,
 }
 
 fn read_manifest(dir: &Path) -> Result<Manifest, String> {
@@ -34,12 +51,26 @@ fn read_manifest(dir: &Path) -> Result<Manifest, String> {
     toml::from_str(&s).map_err(|e| format!("parsing {}: {e}", path.display()))
 }
 
-/// blake3 of `Cargo.lock` — gates the eval-cache (drv reuse is sound as long
-/// as the dependency graph is unchanged).
+/// Backend contribution to the eval-cache key: `Cargo.lock` (dep graph) plus
+/// any `[workspace.metadata.bob].eval-inputs` files (crate overrides, pinned
+/// toolchain, …). The cli further mixes in `bob.nix` and `bob.toml` extras;
+/// see `main::eval_cache_key`. Projects that can't put bob config into their
+/// upstream Cargo.toml use `bob.toml` instead — this path is for first-class
+/// adopters who prefer one less file.
 pub fn lock_hash(repo_root: &Path) -> Result<String, String> {
-    let lock_path = repo_root.join("Cargo.lock");
-    let contents = std::fs::read(&lock_path).map_err(|e| format!("reading Cargo.lock: {e}"))?;
-    Ok(blake3::hash(&contents).to_hex()[..16].to_string())
+    let mut h = blake3::Hasher::new();
+    let lock = std::fs::read(repo_root.join("Cargo.lock"))
+        .map_err(|e| format!("reading Cargo.lock: {e}"))?;
+    h.update(&lock);
+
+    let extras = read_manifest(repo_root)
+        .ok()
+        .and_then(|m| m.workspace)
+        .map(|w| w.metadata.bob.eval_inputs)
+        .unwrap_or_default();
+    bob_core::resolve::hash_eval_inputs(&mut h, repo_root, &extras)?;
+
+    Ok(h.finalize().to_hex()[..16].to_string())
 }
 
 /// `package_name → relative_path` from the root `Cargo.toml`'s
