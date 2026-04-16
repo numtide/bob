@@ -386,9 +386,23 @@ pub fn main(argv: &[String]) -> ! {
     // Anything that LINKS, the build.rs compile, or a build-script probe:
     // needs rlibs IN. Wait for every in-flight dep to commit, re-symlink its
     // rlib/so into target/deps, then exec rustc unchanged.
+    //
+    // The wait keys on the CRATE's BOB_COMPLETE_DEPS, not this invocation's
+    // actual dep references — so skip it when there are none (no `-L
+    // dependency=`, no `--extern`). That covers `--print=cfg`/`-vV`/
+    // `--version` (cnp's Rust builder runs `--print=cfg` from configurePhase;
+    // waiting there serialises every crate on its full closure before it has
+    // emitted any rmeta), `--print file-names`, and std-only autocfg probes.
+    // `--print=native-static-libs` and any other dep-bearing call still wait.
     if c.lib_types.is_empty() || !c.out_is_target_lib {
-        wait_closure_done_and_relink(&cfg, &c.dep_dirs);
-        swap_extern_args_to_rlib(&c.dep_dirs, &mut c.args);
+        let has_dep_refs = !c.dep_dirs.is_empty()
+            || argv
+                .iter()
+                .any(|a| a == "--extern" || a.starts_with("--extern="));
+        if has_dep_refs {
+            wait_closure_done_and_relink(&cfg, &c.dep_dirs);
+            swap_extern_args_to_rlib(&c.dep_dirs, &mut c.args);
+        }
         let err = Command::new(&cfg.real_rustc)
             .args(&c.lib_types)
             .args(&c.link_types)
