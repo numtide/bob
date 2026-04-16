@@ -39,6 +39,23 @@ If your `bob.nix` needs `builtins.resolveCargoWorkspace`, point bob at a patched
 export BOB_NIX_INSTANTIATE=/path/to/patched/nix-instantiate
 ```
 
+### Eval-cache invalidation
+
+bob caches the `nix-instantiate` result so the ~1–2s eval is paid once, not per build. The cache key always covers `bob.nix` and `Cargo.lock`. If `bob.nix` imports other files (crate overrides, `flake.lock` for pins), declare them so edits invalidate the cache — either in `Cargo.toml`:
+
+```toml
+[workspace.metadata.bob]
+eval-inputs = ["flake.lock", "nix/overrides/*.nix"]
+```
+
+or, if you can't put bob config into the upstream manifest, in a `bob.toml` next to `bob.nix`:
+
+```toml
+eval-inputs = ["flake.lock", "nix/overrides/*.nix"]
+```
+
+Both lists are additive. Globs use `*`/`?`/`[…]`/`**`; `*` matches within a single path component (so `nix/*.nix` matches `nix/a.nix` but not `nix/sub/b.nix`), `**` recurses (`nix/**/*.nix` matches both).
+
 ## Commands
 
 ```bash

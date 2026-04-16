@@ -92,8 +92,11 @@ name = "bob-core"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "glob",
  "libc",
+ "serde",
  "serde_json",
+ "toml",
 ]
 
 [[package]]
