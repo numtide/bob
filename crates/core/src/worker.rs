@@ -87,8 +87,21 @@ done
         // tree. Without this, an aborted run leaves orphaned subshells (e.g.
         // aws-lc-sys mid-cmake) writing into tmp/<key>/ that the next run's
         // prepare_tmp() removes from under them.
+        // NIX_BUILD_CORES is part of the standard nix builder environment
+        // (libstore sets it from `--cores`, default = nproc). Replays must
+        // export it: build scripts size `make -j` from it, and cnp's Rust
+        // builder sizes the rustc/build-script jobserver from it (defaulting
+        // to 1 when unset → serial LLVM codegen). Honour an inherited value
+        // so callers can throttle.
+        let cores = std::env::var("NIX_BUILD_CORES").unwrap_or_else(|_| {
+            std::thread::available_parallelism()
+                .map_or(1, |n| n.get())
+                .to_string()
+        });
+
         let mut child = unsafe {
             Command::new(bash)
+                .env("NIX_BUILD_CORES", &cores)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
