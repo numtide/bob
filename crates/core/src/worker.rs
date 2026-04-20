@@ -1,11 +1,10 @@
-//! Persistent bash worker with stdenv pre-sourced.
+//! Persistent bash worker pool.
 //!
-//! Spawns a bash process that sources stdenv/setup once, then accepts
-//! build commands: for each, it forks a subshell that inherits the
-//! fully-initialized stdenv (PATH, genericBuild, hooks, arrays).
-//! Per-build stdout/stderr are redirected to temp files to avoid interleaving.
-//!
-//! This saves ~40ms per crate (stdenv sourcing cost).
+//! Spawns a bash process that accepts build-script paths on stdin and runs
+//! each in a fresh subshell. The worker carries no stdenv state of its own;
+//! each per-build script sources `$stdenv/setup` with that unit's real
+//! `*Inputs`/`outputs` in scope. Per-build stdout/stderr go to temp files to
+//! avoid interleaving.
 //!
 //! ## Pipelining protocol
 //!
@@ -36,35 +35,34 @@ pub struct Worker {
 }
 
 impl Worker {
-    /// Spawn a worker that sources stdenv/setup, then waits for build scripts.
+    /// Spawn a worker that waits for build scripts and runs each in a fresh
+    /// subshell.
+    ///
+    /// stdenv must **not** be sourced in the worker parent: subshells inherit
+    /// non-exported vars, and setup-hooks like `multiple-outputs.sh` cache
+    /// per-drv decisions (`outputLib`, `outputDev`, …) via set-if-unset, so
+    /// any state established here would stick across units with different
+    /// output sets. Each unit's `builder.sh` sources `$stdenv/setup` itself.
     pub fn spawn(bash: &str, stdenv_path: &str) -> Result<Self, String> {
-        let setup = format!("{stdenv_path}/setup");
+        // Cheap toolchain sanity check; the per-build failure surface is far
+        // noisier than "stdenv missing".
+        if !std::path::Path::new(stdenv_path).join("setup").exists() {
+            return Err(format!("stdenv missing at {stdenv_path}"));
+        }
 
         // The parent bash reads script paths from stdin, forks a subshell per
         // script with stdout/stderr to temp files (fd 3 passed through for
         // mid-build __META_READY__ signaling), and reports `__DONE__ <rc>`.
-        // stdenv is sourced inside each build script (after env.sh), not here
-        // — input processing must see the crate's real *Inputs. We pre-source
-        // it once anyway to fail fast if the toolchain is broken.
         //
         // Locale is forced to C: the Nix sandbox has no LC_*/LANG, and host
         // locale leaking into the replay changes sort order, regex character
         // classes, decimal separators (EPOCHREALTIME, printf %f), etc.
-        let init = format!(
-            r#"
+        let init = r#"
 export LC_ALL=C
 unset LANG LANGUAGE
-export out=/dev/null
-export lib=/dev/null
-export outputs="out lib"
-export NIX_ENFORCE_PURITY=0
-export NIX_STORE=/nix/store
 export NIX_BUILD_TOP=/tmp/nib-worker-$$
 export TMPDIR=/tmp/nib-worker-$$
-export HOME=/homeless-shelter
 mkdir -p "$NIX_BUILD_TOP"
-
-source "{setup}" 2>/dev/null || true
 
 # Save stdout as fd 3 for mid-build signaling.
 # Subshells inherit fd 3 so build tools can write
@@ -80,8 +78,7 @@ while IFS= read -r script_path; do
     ( source "$script_path" ) > "$stdout_file" 2> "$stderr_file" 3>&3
     echo "__DONE__ $?"
 done
-"#
-        );
+"#;
 
         // Put the worker in its own process group so Drop can kill the whole
         // tree. Without this, an aborted run leaves orphaned subshells (e.g.
@@ -106,7 +103,7 @@ done
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
                 .arg("-c")
-                .arg(&init)
+                .arg(init)
                 .pre_exec(|| {
                     // setsid(): new session + process group, pgid = pid
                     if libc::setsid() == -1 {
