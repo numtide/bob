@@ -16,7 +16,7 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
@@ -95,11 +95,16 @@ impl SharedState {
 /// `unit_name` / `build_script_hooks` / `output_populated` / `pipeline` come
 /// from the right place. Precomputed once — `is_unit` is cheap but called
 /// per-edge for `pipelineable` below.
-fn backend_for<'a>(backends: &'a [&'a dyn Backend], drv: &Derivation) -> &'a dyn Backend {
+fn backend_for<'a>(
+    backends: &'a [&'a dyn Backend],
+    drv_path: &str,
+    drv: &Derivation,
+    repo_root: &Path,
+) -> &'a dyn Backend {
     backends
         .iter()
         .copied()
-        .find(|b| b.is_unit(drv))
+        .find(|b| b.is_unit(drv_path, drv, repo_root))
         // from_roots() only admits units some backend claimed, so this is
         // unreachable for graph nodes. Fall back to the first backend rather
         // than panic so a future caller passing a non-unit drv degrades.
@@ -111,6 +116,7 @@ pub fn run_parallel(
     cache: &ArtifactCache,
     jobs: usize,
     backends: &[&dyn Backend],
+    repo_root: &Path,
     overrides: &HashMap<String, SourceOverride>,
     roots: &[String],
 ) -> SchedulerResult {
@@ -122,7 +128,7 @@ pub fn run_parallel(
     let backend_of: HashMap<&str, &dyn Backend> = graph
         .nodes
         .iter()
-        .map(|(k, n)| (k.as_str(), backend_for(backends, &n.drv)))
+        .map(|(k, n)| (k.as_str(), backend_for(backends, k, &n.drv, repo_root)))
         .collect();
 
     // Worker pool config from any unit's drv — they all share stdenv/builder.

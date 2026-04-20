@@ -45,7 +45,7 @@ impl BuildGraph {
         root_drv_paths: &[String],
         cache_dir: &Path,
         predicate_key: &str,
-        is_unit: impl Fn(&Derivation) -> bool,
+        is_unit: impl Fn(&str, &Derivation) -> bool,
     ) -> Result<Self, String> {
         let mut hasher = blake3::Hasher::new();
         // bob-core's own package version (Cargo-the-build-system, not the
@@ -180,7 +180,7 @@ impl BuildGraph {
     /// per the supplied predicate; everything else becomes a boundary input.
     pub fn from_roots(
         root_drv_paths: &[String],
-        is_unit: impl Fn(&Derivation) -> bool,
+        is_unit: impl Fn(&str, &Derivation) -> bool,
     ) -> Result<Self, String> {
         let roots: HashSet<&str> = root_drv_paths.iter().map(String::as_str).collect();
         let mut nodes: BTreeMap<String, UnitNode> = BTreeMap::new();
@@ -207,7 +207,7 @@ impl BuildGraph {
             let drv =
                 Derivation::parse(&contents).map_err(|e| format!("parsing {drv_path}: {e}"))?;
 
-            if !is_unit(&drv) {
+            if !is_unit(&drv_path, &drv) {
                 if is_root {
                     return Err(format!("no backend recognises {drv_path} as a build unit"));
                 }

@@ -117,7 +117,6 @@ mod tests {
             env: {
                 let mut m = BTreeMap::new();
                 m.insert("pname".into(), "libfoo".into());
-                m.insert("bobCcSrc".into(), "path/to/foo".into());
                 m
             },
         }

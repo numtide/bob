@@ -20,7 +20,7 @@ impl Backend for RustBackend {
         "rust"
     }
 
-    fn is_unit(&self, drv: &Derivation) -> bool {
+    fn is_unit(&self, _drv_path: &str, drv: &Derivation, _repo_root: &Path) -> bool {
         drv.env.contains_key("crateName")
     }
 

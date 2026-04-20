@@ -117,7 +117,7 @@ backend-specific identifiers.
 ## C/C++ backend
 
 A cc unit is a plain `stdenv.mkDerivation` (cmake or meson, out-of-tree)
-tagged with `bobCcSrc`:
+declared in `bob.nix`:
 
 ```nix
 # bob.nix
@@ -130,10 +130,17 @@ let bobCc = import "${bob}/lib/cc.nix"; in
 }
 ```
 
-`bob build libfoo` then keeps a drv-path-keyed build directory under
+`bobCc.unit` attaches `bobCcSrc` as a Nix-level attribute (`drv // { … }`),
+so `drvPath` is **unchanged** — if `pkgs.libfoo` also appears in some Rust
+crate's `buildInputs`, bob's graph walk from a Rust root finds the same drv
+as a unit and a C edit cascades through to the `.so`. The cc backend
+evaluates `(import bob.nix {}).cc` once to get the drvPath→src map; nothing
+is written into the drv env.
+
+`bob build libfoo` keeps a drv-path-keyed build directory under
 `~/.cache/bob/incremental/` so reconfigure is warm and `ninja` rebuilds only
-the TUs whose `.d` depfiles changed. The marked drv still `nix build`s
-normally — `dontUnpack`/`cmakeBuildDir` are injected only at replay time.
+the TUs whose `.d` depfiles changed. The drv still `nix build`s normally —
+`dontUnpack`/`cmakeBuildDir` are injected only at replay time.
 
 Caveats: unpack/patch are skipped (the build runs against the live worktree),
 so patched derivations are not supported; cc edges are done-gated (no early

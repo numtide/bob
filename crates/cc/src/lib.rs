@@ -4,11 +4,14 @@
 //!
 //! ## Unit model
 //!
-//! Project-grain: one drv = one cmake/meson project. A drv opts in by carrying
-//! `bobCcSrc = "<path relative to repo root>"` in its env (see `lib/cc.nix`).
-//! That single attr is the unit marker, the display name's source-of-truth
-//! lookup, *and* the live source dir for change detection — no separate
-//! manifest.
+//! Project-grain: one drv = one cmake/meson project. Units are declared in
+//! `bob.nix` under `cc.<name>` via `lib/cc.nix`, which attaches `bobCcSrc`
+//! as a *Nix-level* attribute (`drv // { … }`) so `drvPath` is unchanged.
+//! That's load-bearing: the same drv path appears in any Rust crate's
+//! `buildInputs` closure, so `bob build <rust-root>` finds the cc unit in
+//! its graph and a C edit cascades through to the `.so` without overlays.
+//! [`workspace::cc_units`] evaluates the `cc` attrset once to get the
+//! drvPath→src map; nothing is read from the drv env.
 //!
 //! ## Incrementality
 //!
@@ -50,17 +53,13 @@ mod workspace;
 
 pub struct CcBackend;
 
-/// Env-var marker set by `lib/cc.nix`'s `unit`/`units`. Value is the source
-/// dir relative to repo root.
-pub(crate) const MARK: &str = "bobCcSrc";
-
 impl Backend for CcBackend {
     fn id(&self) -> &'static str {
         "cc"
     }
 
-    fn is_unit(&self, drv: &Derivation) -> bool {
-        drv.env.contains_key(MARK)
+    fn is_unit(&self, drv_path: &str, _drv: &Derivation, repo_root: &Path) -> bool {
+        workspace::cc_units(repo_root).contains_key(drv_path)
     }
 
     fn unit_name<'a>(&self, drv: &'a Derivation) -> Cow<'a, str> {
@@ -72,18 +71,14 @@ impl Backend for CcBackend {
             .into()
     }
 
-    fn resolve_attr(&self, target: &str, _repo_root: &Path) -> Option<String> {
-        // The bob.nix `cc.<name>` attr is the contract; CMakeLists
-        // `project()` names often differ (e.g. attr `ndl` vs project
-        // `neuron_kmdlib`), so don't gate on the discovered-project index.
-        // This backend is tried last, after Rust's definitive Cargo.toml
-        // lookup has declined, so claiming optimistically just turns a typo
-        // into nix-instantiate's "attribute 'cc.<name>' missing" — clear
-        // enough, and `list_targets` still offers project-name suggestions.
-        // Reject obvious non-idents so paths/flags don't become attr paths.
-        target
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    fn resolve_attr(&self, target: &str, repo_root: &Path) -> Option<String> {
+        // The bob.nix `cc.<name>` attr is the contract. The map is already
+        // loaded (or loads now, cached), so gate on declared names — unlike
+        // the earlier optimistic claim, this is exact, so a typo falls
+        // through to the cli's "unknown target" suggestion path instead of
+        // a nix-instantiate error.
+        workspace::cc_target_names(repo_root)
+            .contains_key(target)
             .then(|| format!("cc.{target}"))
     }
 
@@ -101,7 +96,10 @@ impl Backend for CcBackend {
     }
 
     fn list_targets(&self, repo_root: &Path) -> Vec<String> {
-        workspace::cc_targets(repo_root).keys().cloned().collect()
+        workspace::cc_target_names(repo_root)
+            .keys()
+            .cloned()
+            .collect()
     }
 
     fn workspace_unit_hashes(

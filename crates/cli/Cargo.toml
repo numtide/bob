@@ -15,4 +15,5 @@ path = "src/main.rs"
 bob-core.workspace = true
 bob-rust.workspace = true
 bob-cc.workspace = true
+blake3.workspace = true
 clap.workspace = true

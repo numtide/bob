@@ -58,7 +58,12 @@ pub trait Backend: Send + Sync {
     // ── graph ──────────────────────────────────────────────────────────────
 
     /// Is this drv a unit we replay? Everything else becomes a boundary input.
-    fn is_unit(&self, drv: &Derivation) -> bool;
+    ///
+    /// `drv_path` and `repo_root` are provided for backends whose unit set is
+    /// declared out-of-band (e.g. cc's drvPath→src map in `bob.nix`) rather
+    /// than via a marker in the drv env. Backends that key purely on
+    /// `drv.env` ignore both.
+    fn is_unit(&self, drv_path: &str, drv: &Derivation, repo_root: &Path) -> bool;
 
     /// Human-readable name for progress output and error messages.
     fn unit_name<'a>(&self, drv: &'a Derivation) -> Cow<'a, str>;
