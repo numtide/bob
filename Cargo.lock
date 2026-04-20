@@ -82,9 +82,18 @@ dependencies = [
 name = "bob"
 version = "0.1.0"
 dependencies = [
+ "bob-cc",
  "bob-core",
  "bob-rust",
  "clap",
+]
+
+[[package]]
+name = "bob-cc"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "bob-core",
 ]
 
 [[package]]

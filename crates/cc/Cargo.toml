@@ -1,0 +1,12 @@
+[package]
+name = "bob-cc"
+description = "C/C++ (cmake/meson via stdenv) backend for bob"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bob-core.workspace = true
+blake3.workspace = true

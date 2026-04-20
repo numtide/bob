@@ -6,16 +6,14 @@ use clap::{Args, Parser, Subcommand};
 
 /// Registered language backends, tried in order for `resolve_attr` /
 /// `detect_from_cwd` / `dispatch_internal`. `is_unit` and
-/// `workspace_unit_hashes` are unioned across all of them.
+/// `workspace_unit_hashes` are unioned across all of them, and the
+/// scheduler dispatches `build_script_hooks` / `output_populated` /
+/// `pipeline` per-node by re-running `is_unit` to find each unit's owner.
 ///
-/// `scheduler::run_parallel` still takes a single backend (the one that
-/// resolved the root target); per-node backend dispatch in mixed-language
-/// graphs is a follow-up once a second backend exists to test against.
-static BACKENDS: &[&dyn Backend] = &[&bob_rust::RustBackend];
-
-fn backend() -> &'static dyn Backend {
-    BACKENDS[0]
-}
+/// Order matters for `resolve_attr`: Rust consults `Cargo.toml` (definitive
+/// member list) so it goes first; cc's `project()`-name walk is a heuristic
+/// and only claims targets Rust declined.
+static BACKENDS: &[&dyn Backend] = &[&bob_rust::RustBackend, &bob_cc::CcBackend];
 
 #[derive(Parser)]
 #[command(
@@ -274,7 +272,12 @@ fn cmd_build(args: BuildArgs) {
                 Some(ov) => ArtifactCache::cache_key_with_source(drv, &ov.source_hash),
                 None => ArtifactCache::cache_key(drv),
             };
-            println!("{key} {} {drv}", backend().unit_name(&node.drv));
+            let name = BACKENDS
+                .iter()
+                .find(|b| b.is_unit(&node.drv))
+                .map(|b| b.unit_name(&node.drv))
+                .unwrap_or("?".into());
+            println!("{key} {name} {drv}");
         }
         return;
     }
@@ -285,7 +288,7 @@ fn cmd_build(args: BuildArgs) {
         jobs
     );
 
-    let result = scheduler::run_parallel(&g, &cache, jobs, backend(), &overrides, &drv_paths);
+    let result = scheduler::run_parallel(&g, &cache, jobs, BACKENDS, &overrides, &drv_paths);
 
     // Result symlinks + --print-out-paths, one per (root, output) following
     // nix-build's naming: <prefix>[-<n>][-<output>], with `-<n>` omitted for
@@ -492,7 +495,11 @@ fn cmd_graph(roots: &[String]) {
             println!("topological order:");
             for (i, drv_path) in g.topo_order.iter().enumerate() {
                 let node = &g.nodes[drv_path];
-                let name = backend().unit_name(&node.drv);
+                let name = BACKENDS
+                    .iter()
+                    .find(|b| b.is_unit(&node.drv))
+                    .map(|b| b.unit_name(&node.drv))
+                    .unwrap_or("?".into());
                 let ndeps = node.unit_deps.len();
                 println!("  {i:3}. {name} ({ndeps} deps)");
             }

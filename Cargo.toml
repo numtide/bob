@@ -25,3 +25,4 @@ toml = { version = "1", default-features = false, features = ["parse", "serde", 
 libc = "0.2"
 bob-core = { path = "crates/core" }
 bob-rust = { path = "crates/rust" }
+bob-cc = { path = "crates/cc" }

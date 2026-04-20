@@ -2,7 +2,7 @@
 
 Fast incremental builds on top of Nix. Replays fine-grained `buildRustCrate` derivations outside the Nix sandbox with a content-addressed artifact cache, persistent stdenv workers, and rustc incremental compilation.
 
-**Status: experimental.** Currently targets Rust workspaces built via [cargo-nix-plugin] / `buildRustCrate`. The core (drv parser, scheduler, cache, path rewriter) is language-agnostic; other backends (Go via go2nix) are planned.
+**Status: experimental.** Currently targets Rust workspaces built via [cargo-nix-plugin] / `buildRustCrate`, and C/C++ projects built with cmake or meson. The core (drv parser, scheduler, cache, path rewriter) is language-agnostic; other backends (Go via go2nix) are planned.
 
 [cargo-nix-plugin]: https://github.com/Mic92/cargo-nix-plugin
 
@@ -91,6 +91,9 @@ crates/
 ├── rust/   bob-rust  — Rust backend: buildRustCrate/cargo-nix-plugin drvs,
 │                     rmeta pipelining via the __rustc-wrap shim,
 │                     -C incremental injection, Cargo workspace introspection
+├── cc/     bob-cc    — C/C++ backend: cmake/meson stdenv drvs marked via
+│                     lib/cc.nix, persistent out-of-tree build dir for
+│                     ninja-level per-TU incrementality (no pipelining yet)
 └── cli/    bob       — the binary; registers backends and wires the CLI
 ```
 
@@ -110,6 +113,31 @@ to `BACKENDS` in `crates/cli/src/main.rs`. The minimum is:
 an early-artifact analogue (Go) get correct done-gated scheduling for free.
 A `core-leakage` flake check enforces that `bob-core` stays free of
 backend-specific identifiers.
+
+## C/C++ backend
+
+A cc unit is a plain `stdenv.mkDerivation` (cmake or meson, out-of-tree)
+tagged with `bobCcSrc`:
+
+```nix
+# bob.nix
+let bobCc = import "${bob}/lib/cc.nix"; in
+{
+  workspaceMembers = …;  # rust
+  cc = bobCc.units {
+    libfoo = { drv = pkgs.libfoo; src = "path/to/libfoo"; };
+  };
+}
+```
+
+`bob build libfoo` then keeps a drv-path-keyed build directory under
+`~/.cache/bob/incremental/` so reconfigure is warm and `ninja` rebuilds only
+the TUs whose `.d` depfiles changed. The marked drv still `nix build`s
+normally — `dontUnpack`/`cmakeBuildDir` are injected only at replay time.
+
+Caveats: unpack/patch are skipped (the build runs against the live worktree),
+so patched derivations are not supported; cc edges are done-gated (no early
+signal yet — see `crates/cc/src/lib.rs` for what's needed).
 
 ## Limitations
 
