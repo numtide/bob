@@ -33,10 +33,23 @@ impl Backend for RustBackend {
     }
 
     fn resolve_attr(&self, target: &str, repo_root: &Path) -> Option<String> {
+        // `<crate>` → `workspaceMembers.<crate>.build`
+        // `<profile>.<crate>` → `<profile>.workspaceMembers.<crate>.build`
+        //
+        // The profile prefix lets a repo's bob.nix expose several cargoNix
+        // instances (e.g. prod-tuned vs dev-loop flags) without bob needing
+        // to know what "profile" means — it's just an attr-path prefix. The
+        // crate part is still gated on Cargo.toml membership so unknown
+        // names fall through to other backends.
+        let (prefix, crate_name) = match target.rsplit_once('.') {
+            Some((p, c)) => (Some(p), c),
+            None => (None, target),
+        };
         let members = workspace::workspace_members(repo_root).ok()?;
-        members
-            .contains_key(target)
-            .then(|| format!("workspaceMembers.{target}.build"))
+        members.contains_key(crate_name).then(|| match prefix {
+            Some(p) => format!("{p}.workspaceMembers.{crate_name}.build"),
+            None => format!("workspaceMembers.{crate_name}.build"),
+        })
     }
 
     fn lock_hash(&self, repo_root: &Path) -> Result<String, String> {
