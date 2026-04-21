@@ -467,7 +467,20 @@ fn worker_loop(
 
             s.in_flight += 1;
             let node = &nodes[&drv_path];
-            let my_tmp = cache.root().join("tmp").join(&eff_key);
+            // tmp/<key> is drv-path-keyed, NOT eff-keyed: `$out`/`$lib` point
+            // here, and many builders embed `$out` into installed files
+            // (cmake's `*Targets.cmake`, pkgconfig `.pc`, rpaths). If the
+            // path moved with the eff-key, the output hash would change on
+            // every source edit and early cutoff could never fire. Same
+            // stability rationale as `incremental_dir` and `NIX_BUILD_TOP`.
+            // The commit destination (`artifacts/<eff-key>/`) is still
+            // eff-keyed, so distinct builds get distinct cache entries;
+            // only the in-progress location is reused (one drv builds at
+            // most once per run, so there's no collision).
+            let my_tmp = cache
+                .root()
+                .join("tmp")
+                .join(ArtifactCache::cache_key(&drv_path));
 
             // Reset tmp/<key> under the lock BEFORE publishing it via
             // output_map. A previous run leaves tmp/<key> populated (commit is
@@ -509,7 +522,10 @@ fn worker_loop(
         progress.start(&unit_name);
 
         let rewriter = executor::make_rewriter(&node.drv, &dep_map);
-        let tmp = cache.root().join("tmp").join(&eff_key);
+        let tmp = cache
+            .root()
+            .join("tmp")
+            .join(ArtifactCache::cache_key(&drv_path));
         let src_ov = SourceOverride {
             src_path,
             eff_key: eff_key.clone(),
