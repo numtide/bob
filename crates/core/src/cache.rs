@@ -110,11 +110,17 @@ impl ArtifactCache {
         Ok(CacheLock(f))
     }
 
-    /// Path to the early-cutoff sidecar for the artifact at `eff_key`:
-    /// `artifacts/<eff_key>/.out-hash`, written on commit, read on cache-hit
-    /// so dependents can key on this unit's *output* rather than its inputs.
+    /// Early-cutoff sidecar for the artifact at `eff_key`, written on commit
+    /// (`.out-hash` = full-artifact hash) and at `__META_READY__`
+    /// (`.early-hash` = interface-artifact hash, e.g. rmeta). Read on
+    /// cache-hit so dependents key on this unit's *output* rather than its
+    /// inputs. A unit may have only `.out-hash` (no early signal); a missing
+    /// `.early-hash` falls back to `.out-hash` at the dependent.
     pub fn out_hash_path(&self, eff_key: &str) -> PathBuf {
         self.artifact_dir_by_key(eff_key).join(".out-hash")
+    }
+    pub fn early_hash_path(&self, eff_key: &str) -> PathBuf {
+        self.artifact_dir_by_key(eff_key).join(".early-hash")
     }
 
     /// blake3 over every regular file under `dir`, ordered by relative path.

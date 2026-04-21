@@ -10,20 +10,28 @@
 //! ### Early cutoff
 //!
 //! Tracked units (see [`overrides::tracked_set`]) use a composite cache key
-//! `eff(c) = H(own(c) ‖ propagated(tracked deps))`, where `propagated(dep)`
-//! is the hash of dep's *committed output*. That hash is only known once dep
-//! is done, so:
+//! `eff(c) = H(own(c) ‖ prop(tracked deps))`. Each tracked dep contributes
+//! one of two propagated hashes:
 //!
-//!   - tracked→tracked edges are forced to **done-gated** (workspace crates
-//!     lose rmeta pipelining among themselves; registry-crate pipelining is
-//!     unaffected since registry crates are never tracked deps),
-//!   - a tracked unit's `eff(c)` is computed when it becomes **ready**
-//!     (worker pulls it), not upfront,
-//!   - if `eff(c)` cache-hits, the worker reads the artifact's `.out-hash`
-//!     into `propagated[c]` and completes without building.
+//!   - **`early[dep]`** = hash of dep's early-signal artifact (rmeta for a
+//!     pipelineable Rust lib), available at `__META_READY__`. Used when `c`
+//!     itself doesn't link (`!needs_dep_done_output(c)`) and `dep` is
+//!     pipelineable — a lib→lib edge. Such edges stay early-gated, so
+//!     workspace pipelining is preserved.
+//!   - **`done[dep]`** = hash of dep's full committed output. Used when `c`
+//!     links (cdylib/bin/proc-macro) or `dep` isn't pipelineable (cc unit,
+//!     `links` crate). These edges are done-gated.
 //!
-//! When a rebuilt dep's output hash equals its previous `.out-hash`,
-//! dependents' `eff` keys don't move and they cache-hit — that's the cutoff.
+//! `eff(c)` is computed when `c` becomes **ready**; if it cache-hits, the
+//! worker reads `.early-hash`/`.out-hash` into `early`/`done` and completes
+//! without building. When a rebuilt dep's relevant hash equals its previous
+//! value, dependents' `eff` keys don't move — that's the cutoff.
+//!
+//! Why two tiers: under `-C incremental`, a Rust crate's rlib bytes are not
+//! reproducible across session states, but its rmeta is. Keying lib→lib on
+//! rmeta lets cutoff fire there while still keying the final link on rlib
+//! bytes (sound: a stale `.so` is never served when any rlib it linked
+//! actually changed).
 //!
 //! Untracked units keep the upfront drv-path-key cache check and the full
 //! pipelining behaviour exactly as before.
@@ -75,11 +83,13 @@ struct SharedState {
     /// Untracked units' keys are precomputed in `untracked_key` outside the
     /// lock (they never change).
     eff_key: HashMap<String, String>,
-    /// Early-cutoff propagated hash per tracked unit: blake3 of its
-    /// committed output, set on commit (executor writes `.out-hash`) or read
-    /// from a cache-hit's artifact. Dependents read this to compute their
-    /// own `eff_key`.
-    propagated: HashMap<String, String>,
+    /// Early-cutoff propagated hashes per tracked unit. `early` is the
+    /// interface-artifact hash (rmeta), set in the `__META_READY__` callback
+    /// or read from a cache-hit's `.early-hash`; `done` is the full-output
+    /// hash, set on commit or read from `.out-hash`. A dependent's eff-key
+    /// reads `early[dep]` for early-gated edges, `done[dep]` otherwise.
+    early_prop: HashMap<String, String>,
+    done_prop: HashMap<String, String>,
     succeeded: usize,
     /// Tracked units that resolved to a cache hit at ready-time. Reported
     /// separately from upfront-cached untracked units so the progress
@@ -211,11 +221,9 @@ pub fn run_parallel(
         true
     };
 
-    // Edge classification is decided by the *dep's* backend's policy. On top
-    // of that, tracked→tracked edges are forced done-gated so the dependent
-    // can read `propagated[dep]` (the committed-output hash) when it becomes
-    // ready. Untracked deps don't contribute to the dependent's eff-key, so
-    // they keep early-gating where the policy allows it.
+    // Per-unit policy bits. `pipelineable[u]` (dep-side): u emits a usable
+    // early artifact. `needs_full[u]` (dependent-side): u's build reads
+    // tracked deps' full output (links) vs just the early artifact (lib).
     let pipelineable: HashMap<String, bool> = graph
         .nodes
         .iter()
@@ -226,9 +234,32 @@ pub fn run_parallel(
             (k.clone(), p)
         })
         .collect();
+    let needs_full: HashMap<String, bool> = graph
+        .nodes
+        .iter()
+        .map(|(k, n)| {
+            (
+                k.clone(),
+                backend_of[k.as_str()].needs_dep_done_output(&n.drv),
+            )
+        })
+        .collect();
+
+    // A tracked dep contributes to the dependent's eff-key. If the dependent
+    // only needs the dep's early artifact (lib→lib), the edge can early-gate
+    // — `early_prop[dep]` is set in the `__META_READY__` callback before
+    // `fire_early`, so it's available when the dependent becomes ready. If
+    // the dependent links, it needs `done_prop[dep]` → done-gate. Untracked
+    // deps don't contribute; gate per `pipelineable[dep]` alone.
     let early_ok = |dep: &str, dependent: &str| {
-        *pipelineable.get(dep).unwrap_or(&false)
-            && !(tracked.contains(dep) && tracked.contains(dependent))
+        if !*pipelineable.get(dep).unwrap_or(&false) {
+            return false;
+        }
+        if !tracked.contains(dep) {
+            return true;
+        }
+        // tracked→tracked: early iff dependent doesn't need dep's done output
+        !*needs_full.get(dependent).unwrap_or(&true)
     };
 
     let mut pending_early: HashMap<String, usize> = HashMap::new();
@@ -315,7 +346,8 @@ pub fn run_parallel(
             output_map,
             early_fired: HashSet::new(),
             eff_key: HashMap::new(),
-            propagated: HashMap::new(),
+            early_prop: HashMap::new(),
+            done_prop: HashMap::new(),
             succeeded: 0,
             late_cached: 0,
             failed: 0,
@@ -335,22 +367,26 @@ pub fn run_parallel(
             let stdenv_path = &stdenv_path;
             let self_exe = &self_exe;
             let cached_artifact_ok = &cached_artifact_ok;
+            let pipelineable = &pipelineable;
+            let needs_full = &needs_full;
             s.spawn(move || {
                 let mut worker =
                     crate::worker::Worker::spawn(bash, stdenv_path).expect("spawning worker");
-                worker_loop(
-                    &state,
-                    &graph.nodes,
+                worker_loop(WorkerCtx {
+                    state: &state,
+                    nodes: &graph.nodes,
                     cache,
                     backend_of,
                     self_exe,
-                    &mut worker,
-                    &progress,
+                    progress: &progress,
                     own,
                     tracked,
+                    pipelineable,
+                    needs_full,
                     cached_artifact_ok,
                     roots,
-                );
+                    worker: &mut worker,
+                });
             });
         }
     });
@@ -374,20 +410,40 @@ pub fn run_parallel(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn worker_loop(
-    state: &(Mutex<SharedState>, Condvar),
-    nodes: &BTreeMap<String, UnitNode>,
-    cache: &ArtifactCache,
-    backend_of: &HashMap<&str, &dyn Backend>,
-    self_exe: &std::path::Path,
-    worker: &mut crate::worker::Worker,
-    progress: &Progress,
-    own: &HashMap<String, OwnHash>,
-    tracked: &HashSet<String>,
-    cached_artifact_ok: &dyn Fn(&str, &UnitNode, &str) -> bool,
-    roots: &HashSet<&str>,
-) {
+/// Per-thread context bag. Purely to keep `worker_loop`'s signature sane;
+/// every field is a borrow of something `run_parallel` owns.
+struct WorkerCtx<'a> {
+    state: &'a (Mutex<SharedState>, Condvar),
+    nodes: &'a BTreeMap<String, UnitNode>,
+    cache: &'a ArtifactCache,
+    backend_of: &'a HashMap<&'a str, &'a dyn Backend>,
+    self_exe: &'a std::path::Path,
+    progress: &'a Progress,
+    own: &'a HashMap<String, OwnHash>,
+    tracked: &'a HashSet<String>,
+    pipelineable: &'a HashMap<String, bool>,
+    needs_full: &'a HashMap<String, bool>,
+    cached_artifact_ok: &'a dyn Fn(&str, &UnitNode, &str) -> bool,
+    roots: &'a HashSet<&'a str>,
+    worker: &'a mut crate::worker::Worker,
+}
+
+fn worker_loop(ctx: WorkerCtx<'_>) {
+    let WorkerCtx {
+        state,
+        nodes,
+        cache,
+        backend_of,
+        self_exe,
+        progress,
+        own,
+        tracked,
+        pipelineable,
+        needs_full,
+        cached_artifact_ok,
+        roots,
+        worker,
+    } = ctx;
     let (lock, cvar) = state;
 
     loop {
@@ -409,12 +465,14 @@ fn worker_loop(
                 let node = &nodes[&drv_path];
 
                 let eff_key = if tracked.contains(&drv_path) {
-                    // All tracked deps are done (forced done-gated), so
-                    // `propagated[dep]` is populated. Untracked deps yield
-                    // None and don't contribute. A tracked dep missing from
-                    // `propagated` (pre-cutoff artifact without `.out-hash`)
-                    // falls back to its eff-key, which is in `eff_key` by
-                    // now since it completed before us.
+                    // For each tracked dep, read whichever propagated hash
+                    // we gated on: `early_prop` for early-gated edges (lib→
+                    // lib), `done_prop` otherwise. Either is set by the time
+                    // we're ready (early in the meta-ready callback before
+                    // `fire_early`; done on commit before `fire_done`). A
+                    // tracked dep missing from both (pre-cutoff artifact
+                    // without sidecar files) falls back to its eff-key.
+                    let i_need_full = *needs_full.get(&drv_path).unwrap_or(&true);
                     let k = ArtifactCache::cache_key_with_source(
                         &drv_path,
                         &eff_hash(
@@ -424,8 +482,17 @@ fn worker_loop(
                                 if !tracked.contains(d) {
                                     return None;
                                 }
-                                s.propagated
-                                    .get(d)
+                                let use_early =
+                                    !i_need_full && *pipelineable.get(d).unwrap_or(&false);
+                                // early → done → eff-key fallback: a
+                                // pipelineable dep may still lack an early
+                                // hash (rmeta-name mismatch so the wrapper
+                                // never signalled, or a pre-rmeta-hash
+                                // artifact); `done_prop` is the next-best
+                                // stable value. eff-key is the last resort
+                                // (input-cascade behaviour for that edge).
+                                if use_early { s.early_prop.get(d) } else { None }
+                                    .or_else(|| s.done_prop.get(d))
                                     .or_else(|| s.eff_key.get(d))
                                     .map(String::as_str)
                             },
@@ -446,13 +513,17 @@ fn worker_loop(
                     for (name, out) in &node.drv.outputs {
                         s.output_map.insert(out.path.clone(), artifact.join(name));
                     }
-                    // Propagated hash for dependents: the `.out-hash`
-                    // sidecar written when this artifact was committed.
-                    // Missing (pre-cutoff cache) → leave unset; dependents
-                    // fall back to our eff-key (input-cascade behaviour for
-                    // this edge, fixed on the next rebuild).
+                    // Propagated hashes for dependents, from the sidecar
+                    // files written when this artifact was committed/
+                    // signalled. A missing `.early-hash` (non-pipelineable
+                    // unit, or pre-this-change artifact) is fine — lib
+                    // dependents fall back to `done_prop` via `or_else`
+                    // since the `early_prop.get` returns None.
                     if let Ok(h) = std::fs::read_to_string(cache.out_hash_path(&eff_key)) {
-                        s.propagated.insert(drv_path.clone(), h);
+                        s.done_prop.insert(drv_path.clone(), h);
+                    }
+                    if let Ok(h) = std::fs::read_to_string(cache.early_hash_path(&eff_key)) {
+                        s.early_prop.insert(drv_path.clone(), h);
                     }
                     s.late_cached += 1;
                     progress.late_cached();
@@ -543,8 +614,15 @@ fn worker_loop(
             &rewriter,
             worker,
             Some(&src_ov),
-            |_early_dir| {
+            |early_dir| {
+                // Hash BEFORE taking the lock and firing: dependents that
+                // become ready on `fire_early` will immediately read
+                // `early_prop[us]` to compute their eff-key.
+                let eh = backend.early_hash(&early_dir);
                 let mut s = lock.lock().unwrap();
+                if let Some(h) = eh {
+                    s.early_prop.insert(drv_path.clone(), h);
+                }
                 s.fire_early(&drv_path);
                 cvar.notify_all();
             },
@@ -559,11 +637,19 @@ fn worker_loop(
                     s.succeeded += 1;
                     progress.finish(&unit_name, r.duration);
 
-                    // Executor wrote `.out-hash` on commit; read it back so
-                    // tracked dependents (done-gated on us) key on it.
                     if tracked.contains(&drv_path) {
+                        // Executor wrote `.out-hash` on commit; read it back
+                        // for done-gated dependents.
                         if let Ok(h) = std::fs::read_to_string(cache.out_hash_path(&eff_key)) {
-                            s.propagated.insert(drv_path.clone(), h);
+                            s.done_prop.insert(drv_path.clone(), h);
+                        }
+                        // Persist `.early-hash` next to it so a future
+                        // late-cache-hit at this eff-key can serve lib
+                        // dependents the rmeta hash. (The on-meta-ready
+                        // callback only stored it in `early_prop`; the commit
+                        // hardlink-tree skips dotfiles.)
+                        if let Some(eh) = s.early_prop.get(&drv_path) {
+                            let _ = std::fs::write(cache.early_hash_path(&eff_key), eh);
                         }
                     }
 

@@ -89,6 +89,25 @@ impl Backend for RustBackend {
         Some(&PIPELINE)
     }
 
+    fn needs_dep_done_output(&self, drv: &Derivation) -> bool {
+        // A pure lib/rlib crate's compile reads deps' rmeta only (rustc-wrap
+        // explicitly drives the lib half on `--extern …=*.rmeta`). Anything
+        // that links (cdylib/staticlib/bin) or is loaded as a plugin
+        // (proc-macro) needs the actual rlib/.so bytes, whose hash is only
+        // known at commit. crateType absent → bin-only → links.
+        let ct = drv.env.get("crateType").map(String::as_str).unwrap_or("");
+        ct.is_empty() || ct.split_whitespace().any(|t| !matches!(t, "lib" | "rlib"))
+    }
+
+    fn early_hash(&self, early_dir: &Path) -> Option<String> {
+        // `early_dir` is the rmeta dir signalled by rustc-wrap. The rmeta is
+        // the crate's interface; under `-C incremental` the rlib's object
+        // code is non-deterministic across session states, but the rmeta IS
+        // byte-stable for unchanged inputs — so this is the right propagated
+        // value for lib→lib cutoff.
+        Some(bob_core::ArtifactCache::hash_tree(early_dir))
+    }
+
     fn dispatch_internal(&self, cmd: &str, args: &[String]) {
         if cmd == "__rustc-wrap" {
             rustc_wrap::main(args);

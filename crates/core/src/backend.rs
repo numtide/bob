@@ -109,11 +109,34 @@ pub trait Backend: Send + Sync {
     /// versions (errexit vs `eval`'d phases).
     fn output_populated(&self, tmp: &Path, drv: &Derivation) -> bool;
 
-    // ── pipelining (optional) ──────────────────────────────────────────────
+    // ── pipelining + early-cutoff propagation (optional) ────────────────────
 
     /// `None` → every edge is done-gated; the backend never emits a mid-build
     /// signal.
     fn pipeline(&self) -> Option<&dyn PipelinePolicy> {
+        None
+    }
+
+    /// Does this unit's build need its tracked deps' *full* (committed)
+    /// output, or does the early-signal artifact suffice? Decides which
+    /// propagated hash the unit's eff-key reads, and so whether tracked→this
+    /// edges may early-gate. Default `true` (done-gate everything) is the
+    /// conservative choice for backends without a separable interface
+    /// artifact.
+    ///
+    /// Rust: a pure `lib`/`rlib` crate compiles against deps' rmeta only; any
+    /// crate that links (cdylib/staticlib/bin) or loads (proc-macro) reads
+    /// deps' rlib/\.so and so needs the done hash.
+    fn needs_dep_done_output(&self, _drv: &Derivation) -> bool {
+        true
+    }
+
+    /// Hash of the early-signal artifact. Called from the scheduler's
+    /// `__META_READY__` callback with the directory the wrapper signalled
+    /// (e.g. the rmeta dir). The result is the `early_propagated` value
+    /// dependents whose `needs_dep_done_output` is `false` key on. `None` →
+    /// the done hash is used for both (backends that don't pipeline).
+    fn early_hash(&self, _early_dir: &Path) -> Option<String> {
         None
     }
 
