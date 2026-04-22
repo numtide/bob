@@ -179,7 +179,13 @@ mod tests {
     use std::fs;
 
     fn tempdir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("bob-test-{}", std::process::id()));
+        // Tests run in parallel threads within one process; pid alone collides
+        // (cache_key_stable's remove_dir_all races hash_tree_content_addressed's
+        // create_dir_all). Per-call counter + pid is unique within and across
+        // processes.
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("bob-test-{}-{n}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
