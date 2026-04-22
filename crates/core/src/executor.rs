@@ -21,25 +21,21 @@ use crate::cache::ArtifactCache;
 use crate::drv::Derivation;
 use crate::rewrite::PathRewriter;
 
-/// Override for a unit's cache key (and optionally its source) when reusing
-/// a cached drv whose inputs have effectively changed.
+/// Per-unit build-time override: the live source directory (if this unit's
+/// own source is tracked) and the resolved early-cutoff cache key.
 ///
-/// `source_hash` is the *effective* hash: it incorporates this unit's own
-/// source content AND the effective hashes of all its workspace deps. This
-/// cascades invalidation through the DAG without changing drv paths, so a
-/// change to a workspace unit's source produces a new key for that unit and
-/// every downstream workspace unit, while external (registry) deps — which
-/// never sit downstream of workspace units — keep their plain
-/// `blake3(drv_path)` key.
+/// `eff_key` is computed by the scheduler at ready-time from this unit's
+/// own-source hash plus its tracked deps' *output* hashes (see
+/// `overrides::eff_hash`); it is `None` for untracked units, which use the
+/// plain `blake3(drv_path)` key.
 #[derive(Clone, Debug)]
 pub struct SourceOverride {
     /// Local source directory to use instead of the store path in the drv.
-    /// `None` when only the cache key changes (i.e., this unit's own source
-    /// is unchanged but a dep's effective hash differs) — currently every
-    /// overridden unit is a workspace unit so this is always `Some`.
+    /// `None` for tracked units whose own source isn't being overridden
+    /// (i.e. the unit is only tracked because a dep is).
     pub src_path: Option<PathBuf>,
-    /// Effective source hash, mixed into the cache key.
-    pub source_hash: String,
+    /// Resolved composite cache key for this unit.
+    pub eff_key: String,
 }
 
 /// Result of executing a single unit build.
@@ -71,7 +67,7 @@ pub fn build_unit(
         ..
     } = ctx;
     let effective_key = match src_override {
-        Some(ov) => ArtifactCache::cache_key_with_source(drv_path, &ov.source_hash),
+        Some(ov) => ov.eff_key.clone(),
         None => ArtifactCache::cache_key(drv_path),
     };
     let unit_name = backend.unit_name(drv).into_owned();
@@ -270,6 +266,12 @@ exit $rc
             let _ = std::fs::remove_dir_all(&dest);
             return Err(format!("committing {unit_name}: {e}"));
         }
+        // Early-cutoff sidecar: hash the committed outputs (not rmeta/ — that's
+        // an internal pipelining artifact) so dependents key on our output
+        // content, not our inputs. Written under the dest (artifacts/<key>/)
+        // so a future cache-hit at this key can read it without rebuilding.
+        let out_hash = ArtifactCache::hash_tree(&dest);
+        let _ = std::fs::write(cache.out_hash_path(&effective_key), &out_hash);
         // Signal full completion for any wrapper polling on us (consumers that
         // need the linkable artifact, not just the early metadata).
         let _ = std::fs::write(tmp.join("done"), b"");

@@ -110,6 +110,58 @@ impl ArtifactCache {
         Ok(CacheLock(f))
     }
 
+    /// Early-cutoff sidecar for the artifact at `eff_key`, written on commit
+    /// (`.out-hash` = full-artifact hash) and at `__META_READY__`
+    /// (`.early-hash` = interface-artifact hash, e.g. rmeta). Read on
+    /// cache-hit so dependents key on this unit's *output* rather than its
+    /// inputs. A unit may have only `.out-hash` (no early signal); a missing
+    /// `.early-hash` falls back to `.out-hash` at the dependent.
+    pub fn out_hash_path(&self, eff_key: &str) -> PathBuf {
+        self.artifact_dir_by_key(eff_key).join(".out-hash")
+    }
+    pub fn early_hash_path(&self, eff_key: &str) -> PathBuf {
+        self.artifact_dir_by_key(eff_key).join(".early-hash")
+    }
+
+    /// blake3 over every regular file under `dir`, ordered by relative path.
+    /// Symlinks contribute their target string (so a relinked `lib<name>.so`
+    /// pointing at a new hashed filename still moves the hash). Used for the
+    /// early-cutoff propagated hash; cheap on rlib/rmeta-sized outputs and
+    /// still fine for cc libs (a few MB).
+    pub fn hash_tree(dir: &Path) -> String {
+        fn walk(h: &mut blake3::Hasher, base: &Path, dir: &Path) {
+            let mut entries: Vec<_> = match std::fs::read_dir(dir) {
+                Ok(rd) => rd.flatten().collect(),
+                Err(_) => return,
+            };
+            entries.sort_by_key(|e| e.file_name());
+            for e in entries {
+                let p = e.path();
+                let name = e.file_name();
+                // Skip our own sidecar and stderr/stdout capture files.
+                if name.to_string_lossy().starts_with('.') {
+                    continue;
+                }
+                let Ok(ft) = e.file_type() else { continue };
+                let rel = p.strip_prefix(base).unwrap_or(&p);
+                h.update(rel.as_os_str().as_encoded_bytes());
+                h.update(b"\0");
+                if ft.is_dir() {
+                    walk(h, base, &p);
+                } else if ft.is_symlink() {
+                    if let Ok(t) = std::fs::read_link(&p) {
+                        h.update(t.as_os_str().as_encoded_bytes());
+                    }
+                } else if let Ok(mut f) = std::fs::File::open(&p) {
+                    let _ = std::io::copy(&mut f, h);
+                }
+            }
+        }
+        let mut h = blake3::Hasher::new();
+        walk(&mut h, dir, dir);
+        h.finalize().to_hex()[..32].to_string()
+    }
+
     /// Persistent per-unit incremental-compilation state. Unlike
     /// `artifact_dir` (replaced on each build), this persists across builds
     /// so the backend's compiler can reuse work (`-C incremental`, `GOCACHE`,
@@ -127,10 +179,44 @@ mod tests {
     use std::fs;
 
     fn tempdir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("bob-test-{}", std::process::id()));
+        // Tests run in parallel threads within one process; pid alone collides
+        // (cache_key_stable's remove_dir_all races hash_tree_content_addressed's
+        // create_dir_all). Per-call counter + pid is unique within and across
+        // processes.
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("bob-test-{}-{n}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn hash_tree_content_addressed() {
+        let d = tempdir();
+        fs::create_dir_all(d.join("out/lib")).unwrap();
+        fs::write(d.join("out/lib/libfoo.a"), b"v1").unwrap();
+        fs::write(d.join(".out-hash"), b"ignored").unwrap(); // dot-file skipped
+        let h1 = ArtifactCache::hash_tree(&d);
+
+        // Same content, fresh mtimes → same hash.
+        fs::write(d.join("out/lib/libfoo.a"), b"v1").unwrap();
+        assert_eq!(h1, ArtifactCache::hash_tree(&d));
+
+        // Content change → hash moves.
+        fs::write(d.join("out/lib/libfoo.a"), b"v2").unwrap();
+        assert_ne!(h1, ArtifactCache::hash_tree(&d));
+
+        // New file → hash moves; symlink target contributes.
+        fs::write(d.join("out/lib/libfoo.a"), b"v1").unwrap();
+        std::os::unix::fs::symlink("libfoo.a", d.join("out/lib/libfoo.so")).unwrap();
+        let h2 = ArtifactCache::hash_tree(&d);
+        assert_ne!(h1, h2);
+        fs::remove_file(d.join("out/lib/libfoo.so")).unwrap();
+        std::os::unix::fs::symlink("other", d.join("out/lib/libfoo.so")).unwrap();
+        assert_ne!(h2, ArtifactCache::hash_tree(&d));
+
+        let _ = fs::remove_dir_all(&d);
     }
 
     #[test]

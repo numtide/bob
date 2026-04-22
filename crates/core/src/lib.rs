@@ -24,4 +24,4 @@ pub use cache::ArtifactCache;
 pub use drv::Derivation;
 pub use executor::SourceOverride;
 pub use graph::{BuildGraph, UnitNode};
-pub use overrides::OwnHash;
+pub use overrides::{tracked_set, OwnHash};

@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::path::PathBuf;
 
-use bob_core::{drv, graph, overrides, resolve, scheduler, ArtifactCache, Backend};
+use bob_core::{drv, graph, resolve, scheduler, tracked_set, ArtifactCache, Backend};
 use clap::{Args, Parser, Subcommand};
 
 /// Registered language backends, tried in order for `resolve_attr` /
@@ -265,25 +265,36 @@ fn cmd_build(args: BuildArgs) {
     // Realize any missing source tarballs / build inputs
     g.realize_inputs().expect("realizing inputs");
 
-    // Per-unit source overrides with cascading invalidation; see
-    // overrides::cascade for the algorithm. Each backend supplies own-source
-    // hashes for the workspace units it recognises.
+    // Each backend supplies own-source hashes for the workspace units it
+    // recognises. `tracked` is the closure of those under unit_deps; tracked
+    // units use early-cutoff (output-hash) cache keys resolved at ready-time
+    // in the scheduler. Everything else stays on plain drv-path keys.
     let mut own = std::collections::HashMap::new();
     for b in BACKENDS {
         own.extend(b.workspace_unit_hashes(&repo_root, &g));
     }
-    let overrides = overrides::cascade(&g, own);
+    let tracked = tracked_set(&g, &own);
     eprintln!(
         "  \x1b[2mTracking {} workspace unit(s) for source changes\x1b[0m",
-        overrides.len()
+        tracked.len()
+    );
+
+    eprintln!(
+        "\x1b[1m  Compiling\x1b[0m {} units ({} jobs)",
+        g.unit_count(),
+        jobs
+    );
+
+    let result = scheduler::run_parallel(
+        &g, &cache, jobs, BACKENDS, &repo_root, &own, &tracked, &drv_paths,
     );
 
     if dump_keys {
+        // Tracked units' keys are only known post-scheduler (early cutoff
+        // resolves them at ready-time), so --dump-keys now implies a full
+        // run. Acceptable for a hidden bench-harness flag.
         for (drv, node) in &g.nodes {
-            let key = match overrides.get(drv) {
-                Some(ov) => ArtifactCache::cache_key_with_source(drv, &ov.source_hash),
-                None => ArtifactCache::cache_key(drv),
-            };
+            let key = result.keys.get(drv).cloned().unwrap_or_default();
             let name = BACKENDS
                 .iter()
                 .find(|b| b.is_unit(drv, &node.drv, &repo_root))
@@ -294,29 +305,18 @@ fn cmd_build(args: BuildArgs) {
         return;
     }
 
-    eprintln!(
-        "\x1b[1m  Compiling\x1b[0m {} units ({} jobs)",
-        g.unit_count(),
-        jobs
-    );
-
-    let result = scheduler::run_parallel(
-        &g, &cache, jobs, BACKENDS, &repo_root, &overrides, &drv_paths,
-    );
-
     // Result symlinks + --print-out-paths, one per (root, output) following
     // nix-build's naming: <prefix>[-<n>][-<output>], with `-<n>` omitted for
     // the first root and `-<output>` omitted for `out`. Unlike before, lib-only
     // roots get a link too (`result-lib`), so callers can locate the artifact
     // without a second `--dump-keys` round-trip.
     for (idx, r) in resolve_results.iter().enumerate() {
-        let artifact = match overrides.get(&r.drv_path) {
-            Some(ov) => cache.artifact_dir_by_key(&ArtifactCache::cache_key_with_source(
-                &r.drv_path,
-                &ov.source_hash,
-            )),
-            None => cache.artifact_dir(&r.drv_path),
-        };
+        let key = result
+            .keys
+            .get(&r.drv_path)
+            .cloned()
+            .unwrap_or_else(|| ArtifactCache::cache_key(&r.drv_path));
+        let artifact = cache.artifact_dir_by_key(&key);
         if !artifact.exists() {
             // Build failed or aborted before commit; skip silently, the
             // failure summary already reported it.

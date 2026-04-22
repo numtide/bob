@@ -50,6 +50,15 @@ impl Progress {
         inner.render_progress();
     }
 
+    /// A tracked unit resolved to a cache hit at ready-time (early cutoff).
+    /// Counts toward `completed` so the [n/total] line advances; no "Built"
+    /// line, since nothing was built.
+    pub fn late_cached(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.completed += 1;
+        inner.render_progress();
+    }
+
     /// A crate finished building successfully.
     pub fn finish(&self, name: &str, duration: std::time::Duration) {
         let mut inner = self.inner.lock().unwrap();
