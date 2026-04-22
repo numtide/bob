@@ -6,16 +6,14 @@ use clap::{Args, Parser, Subcommand};
 
 /// Registered language backends, tried in order for `resolve_attr` /
 /// `detect_from_cwd` / `dispatch_internal`. `is_unit` and
-/// `workspace_unit_hashes` are unioned across all of them.
+/// `workspace_unit_hashes` are unioned across all of them, and the
+/// scheduler dispatches `build_script_hooks` / `output_populated` /
+/// `pipeline` per-node by re-running `is_unit` to find each unit's owner.
 ///
-/// `scheduler::run_parallel` still takes a single backend (the one that
-/// resolved the root target); per-node backend dispatch in mixed-language
-/// graphs is a follow-up once a second backend exists to test against.
-static BACKENDS: &[&dyn Backend] = &[&bob_rust::RustBackend];
-
-fn backend() -> &'static dyn Backend {
-    BACKENDS[0]
-}
+/// Order matters for `resolve_attr`: Rust consults `Cargo.toml` (definitive
+/// member list) so it goes first; cc's `project()`-name walk is a heuristic
+/// and only claims targets Rust declined.
+static BACKENDS: &[&dyn Backend] = &[&bob_rust::RustBackend, &bob_cc::CcBackend];
 
 #[derive(Parser)]
 #[command(
@@ -195,18 +193,26 @@ fn resolve_target(
     eval_cache.resolve_one(repo_root, &name, &attr, &lock_hash)
 }
 
-fn is_unit(d: &bob_core::Derivation) -> bool {
-    BACKENDS.iter().any(|b| b.is_unit(d))
+fn is_unit(repo_root: &Path) -> impl Fn(&str, &bob_core::Derivation) -> bool + '_ {
+    move |path, d| BACKENDS.iter().any(|b| b.is_unit(path, d, repo_root))
 }
 
 /// Stable identifier for the `is_unit` predicate, mixed into the graph-cache
-/// key so adding/removing a backend invalidates cached graphs.
-fn predicate_key() -> String {
-    BACKENDS
-        .iter()
-        .map(|b| b.id())
-        .collect::<Vec<_>>()
-        .join(",")
+/// key so adding/removing a backend invalidates cached graphs. Also folds in
+/// `bob.nix` content: cc's `is_unit` keys on the drvPath→src map declared
+/// there, and adding a cc unit doesn't move any root drv path, so without
+/// this a cached graph from before the addition would be served and the new
+/// unit would silently stay a boundary input.
+fn predicate_key(repo_root: &Path) -> String {
+    let mut h = blake3::Hasher::new();
+    for b in BACKENDS {
+        h.update(b.id().as_bytes());
+        h.update(b"\0");
+    }
+    if let Ok(b) = std::fs::read(repo_root.join("bob.nix")) {
+        h.update(&b);
+    }
+    h.finalize().to_hex()[..16].to_string()
 }
 
 fn cmd_build(args: BuildArgs) {
@@ -248,9 +254,13 @@ fn cmd_build(args: BuildArgs) {
     }
 
     let drv_paths: Vec<String> = resolve_results.iter().map(|r| r.drv_path.clone()).collect();
-    let g =
-        graph::BuildGraph::from_roots_cached(&drv_paths, cache.root(), &predicate_key(), is_unit)
-            .expect("building graph");
+    let g = graph::BuildGraph::from_roots_cached(
+        &drv_paths,
+        cache.root(),
+        &predicate_key(&repo_root),
+        is_unit(&repo_root),
+    )
+    .expect("building graph");
 
     // Realize any missing source tarballs / build inputs
     g.realize_inputs().expect("realizing inputs");
@@ -274,7 +284,12 @@ fn cmd_build(args: BuildArgs) {
                 Some(ov) => ArtifactCache::cache_key_with_source(drv, &ov.source_hash),
                 None => ArtifactCache::cache_key(drv),
             };
-            println!("{key} {} {drv}", backend().unit_name(&node.drv));
+            let name = BACKENDS
+                .iter()
+                .find(|b| b.is_unit(drv, &node.drv, &repo_root))
+                .map(|b| b.unit_name(&node.drv))
+                .unwrap_or("?".into());
+            println!("{key} {name} {drv}");
         }
         return;
     }
@@ -285,7 +300,9 @@ fn cmd_build(args: BuildArgs) {
         jobs
     );
 
-    let result = scheduler::run_parallel(&g, &cache, jobs, backend(), &overrides, &drv_paths);
+    let result = scheduler::run_parallel(
+        &g, &cache, jobs, BACKENDS, &repo_root, &overrides, &drv_paths,
+    );
 
     // Result symlinks + --print-out-paths, one per (root, output) following
     // nix-build's naming: <prefix>[-<n>][-<output>], with `-<n>` omitted for
@@ -486,13 +503,21 @@ fn cmd_parse_drv(path: &Path) {
 }
 
 fn cmd_graph(roots: &[String]) {
-    match graph::BuildGraph::from_roots(roots, is_unit) {
+    // `bob graph` is a debugging aid; if there's no bob.nix above cwd, fall
+    // back to an empty repo_root so backends that don't need it (rust) still
+    // classify, and cc units simply won't be recognised.
+    let repo_root = find_repo_root().unwrap_or_default();
+    match graph::BuildGraph::from_roots(roots, is_unit(&repo_root)) {
         Ok(g) => {
             println!("units in graph: {}", g.unit_count());
             println!("topological order:");
             for (i, drv_path) in g.topo_order.iter().enumerate() {
                 let node = &g.nodes[drv_path];
-                let name = backend().unit_name(&node.drv);
+                let name = BACKENDS
+                    .iter()
+                    .find(|b| b.is_unit(drv_path, &node.drv, &repo_root))
+                    .map(|b| b.unit_name(&node.drv))
+                    .unwrap_or("?".into());
                 let ndeps = node.unit_deps.len();
                 println!("  {i:3}. {name} ({ndeps} deps)");
             }

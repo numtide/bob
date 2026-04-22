@@ -40,7 +40,10 @@ impl ArtifactCache {
         }
     }
 
-    #[cfg(test)]
+    /// Test/bench constructor: point the cache at an arbitrary root. Used
+    /// by backend crates' tests, so it can't be `#[cfg(test)]` (that only
+    /// applies within `bob-core`'s own test build).
+    #[doc(hidden)]
     pub fn from_path(root: PathBuf) -> Self {
         Self { root }
     }

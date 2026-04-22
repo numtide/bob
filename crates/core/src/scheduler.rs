@@ -16,7 +16,7 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
@@ -24,6 +24,7 @@ use std::thread;
 
 use crate::backend::{Backend, BuildContext};
 use crate::cache::ArtifactCache;
+use crate::drv::Derivation;
 use crate::executor::{self, SourceOverride};
 use crate::graph::{BuildGraph, UnitNode};
 use crate::progress::Progress;
@@ -89,20 +90,50 @@ impl SharedState {
     }
 }
 
+/// Per-node backend dispatch. Each unit was admitted to the graph by exactly
+/// one backend's `is_unit` (the cli unions them); rediscover which one here so
+/// `unit_name` / `build_script_hooks` / `output_populated` / `pipeline` come
+/// from the right place. Precomputed once — `is_unit` is cheap but called
+/// per-edge for `pipelineable` below.
+fn backend_for<'a>(
+    backends: &'a [&'a dyn Backend],
+    drv_path: &str,
+    drv: &Derivation,
+    repo_root: &Path,
+) -> &'a dyn Backend {
+    backends
+        .iter()
+        .copied()
+        .find(|b| b.is_unit(drv_path, drv, repo_root))
+        // from_roots() only admits units some backend claimed, so this is
+        // unreachable for graph nodes. Fall back to the first backend rather
+        // than panic so a future caller passing a non-unit drv degrades.
+        .unwrap_or(backends[0])
+}
+
 pub fn run_parallel(
     graph: &BuildGraph,
     cache: &ArtifactCache,
     jobs: usize,
-    backend: &dyn Backend,
+    backends: &[&dyn Backend],
+    repo_root: &Path,
     overrides: &HashMap<String, SourceOverride>,
     roots: &[String],
 ) -> SchedulerResult {
     let roots: HashSet<&str> = roots.iter().map(String::as_str).collect();
     let start = std::time::Instant::now();
-    let pl = backend.pipeline();
     let self_exe = std::env::current_exe().expect("resolving self exe");
 
+    // drv_path → owning backend. See `backend_for`.
+    let backend_of: HashMap<&str, &dyn Backend> = graph
+        .nodes
+        .iter()
+        .map(|(k, n)| (k.as_str(), backend_for(backends, k, &n.drv, repo_root)))
+        .collect();
+
     // Worker pool config from any unit's drv — they all share stdenv/builder.
+    // Mixed-backend graphs share stdenv too (it's nixpkgs', not the
+    // language's), so any node will do.
     let Some(first_drv) = graph.nodes.values().next() else {
         // from_roots() rejects missing/non-unit roots, so this only triggers
         // when called with no roots at all.
@@ -135,7 +166,7 @@ pub fn run_parallel(
         // deps (e.g. Rust cdylib roots need the .so; a prior non-root run may
         // have committed rlib-only). Absence is just "rebuild", not an error.
         if roots.contains(drv) {
-            return pl.is_none_or(|p| {
+            return backend_of[drv].pipeline().is_none_or(|p| {
                 p.cached_artifact_sufficient_as_root(&node.drv, &artifact_dir(drv))
             });
         }
@@ -143,10 +174,23 @@ pub fn run_parallel(
     };
     let tmp_dir = |drv: &str| cache.root().join("tmp").join(key_for(drv));
 
+    // Edge classification is decided by the *dep's* backend's policy: that's
+    // the side that knows whether it emits a usable early artifact. A backend
+    // with `pipeline() == None` (cc today) is done-gated for all dependents.
+    // Cross-backend caveat: a pipelineable Rust dep will early-unblock a cc
+    // dependent, which is harmless because cc units consume Rust deps (if at
+    // all) as boundary `buildInputs`, not as in-graph unit deps — so the edge
+    // doesn't exist in practice. If it ever does, make `is_pipelineable`
+    // edge-aware (dep, dependent) and gate on dependent's backend too.
     let pipelineable: HashMap<String, bool> = graph
         .nodes
         .iter()
-        .map(|(k, n)| (k.clone(), pl.is_some_and(|p| p.is_pipelineable(&n.drv))))
+        .map(|(k, n)| {
+            let p = backend_of[k.as_str()]
+                .pipeline()
+                .is_some_and(|p| p.is_pipelineable(&n.drv));
+            (k.clone(), p)
+        })
         .collect();
 
     let mut pending_early: HashMap<String, usize> = HashMap::new();
@@ -232,6 +276,7 @@ pub fn run_parallel(
             let bash = &bash;
             let stdenv_path = &stdenv_path;
             let self_exe = &self_exe;
+            let backend_of = &backend_of;
             s.spawn(move || {
                 let mut worker =
                     crate::worker::Worker::spawn(bash, stdenv_path).expect("spawning worker");
@@ -239,7 +284,7 @@ pub fn run_parallel(
                     &state,
                     &graph.nodes,
                     cache,
-                    backend,
+                    backend_of,
                     self_exe,
                     &mut worker,
                     &progress,
@@ -263,7 +308,7 @@ fn worker_loop(
     state: &(Mutex<SharedState>, Condvar),
     nodes: &BTreeMap<String, UnitNode>,
     cache: &ArtifactCache,
-    backend: &dyn Backend,
+    backend_of: &HashMap<&str, &dyn Backend>,
     self_exe: &std::path::Path,
     worker: &mut crate::worker::Worker,
     progress: &Progress,
@@ -331,6 +376,7 @@ fn worker_loop(
         };
 
         let node = &nodes[&drv_path];
+        let backend = backend_of[drv_path.as_str()];
         let unit_name = backend.unit_name(&node.drv).into_owned();
         progress.start(&unit_name);
 

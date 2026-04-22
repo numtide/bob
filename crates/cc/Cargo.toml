@@ -1,19 +1,12 @@
 [package]
-name = "bob"
-description = "Bob the Builder — fast incremental builds on top of Nix"
+name = "bob-cc"
+description = "C/C++ (cmake/meson via stdenv) backend for bob"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
-[[bin]]
-name = "bob"
-path = "src/main.rs"
-
 [dependencies]
 bob-core.workspace = true
-bob-rust.workspace = true
-bob-cc.workspace = true
 blake3.workspace = true
-clap.workspace = true
