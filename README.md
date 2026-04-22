@@ -21,7 +21,7 @@ On repeat builds only changed crates rebuild; unchanged crates are served from c
 bob needs two things from the target repo:
 
 1. **Per-crate derivations** — a Cargo workspace wired through cargo-nix-plugin's `buildRustCrate`, so each crate is its own `.drv`.
-2. **A `bob.nix` at the repo root** that exposes `workspaceMembers.<name>.build`:
+2. **A `bob.nix` at the repo root** with one top-level attr per backend. The Rust backend reads `rust.workspaceMembers.<name>.build`:
 
    ```nix
    # bob.nix
@@ -29,7 +29,7 @@ bob needs two things from the target repo:
    let
      cargoNix = pkgs.callPackage ./Cargo.nix {};  # or however your repo wires cargo-nix-plugin
    in {
-     inherit (cargoNix) workspaceMembers;
+     rust = { inherit (cargoNix) workspaceMembers; };
    }
    ```
 
@@ -104,7 +104,7 @@ to `BACKENDS` in `crates/cli/src/main.rs`. The minimum is:
 
 - `is_unit(drv)` — e.g. `drv.env.contains_key("goPackagePath")`
 - `unit_name(drv)` — progress display
-- `resolve_attr(target, root)` — attr path under `(import bob.nix {})`
+- `resolve_attr(target, root)` — attr path under `(import bob.nix {}).<id()>`
 - `lock_hash(root)` — e.g. `blake3(go.sum)`
 - `build_script_hooks(ctx)` — e.g. `export GOCACHE=…`
 - `output_populated(tmp, drv)`
@@ -123,7 +123,7 @@ declared in `bob.nix`:
 # bob.nix
 let bobCc = import "${bob}/lib/cc.nix"; in
 {
-  workspaceMembers = …;  # rust
+  rust = { inherit (cargoNix) workspaceMembers; };
   cc = bobCc.units {
     libfoo = { drv = pkgs.libfoo; src = "path/to/libfoo"; };
   };

@@ -126,8 +126,8 @@ fn main() {
 }
 
 /// Find the repo root by walking up from cwd looking for `bob.nix`.
-/// `bob.nix` is the per-repo glue that exposes
-/// `workspaceMembers.<name>.build` for nix-instantiate resolution.
+/// `bob.nix` is the per-repo glue that exposes one top-level attr per
+/// backend (`rust`, `cc`, …) for nix-instantiate resolution.
 fn find_repo_root() -> Result<PathBuf, String> {
     if let Ok(r) = std::env::var("BOB_REPO_ROOT") {
         return Ok(PathBuf::from(r));
