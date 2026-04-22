@@ -11,10 +11,41 @@ Fast incremental builds on top of Nix. Replays fine-grained `buildRustCrate` der
 1. **Resolve** — translate a workspace member name to a `.drv` path via `nix-instantiate` (cached on `Cargo.lock` hash)
 2. **Graph** — parse `.drv` files directly (ATerm) to build the crate dependency DAG
 3. **Build** — replay each crate's configure/build/install phases in parallel, in persistent bash workers with `$stdenv/setup` pre-sourced; non-crate inputs (toolchain, C libs, fetchers) are realised once via `nix-store --realise`
-4. **Cache** — artifacts keyed by `blake3(drv_path)`; the drv path already encodes all inputs via Nix's own hashing, so invalidation is automatic and sound
+4. **Cache** — registry/untracked units key on `blake3(drv_path)` (Nix has already hashed all their inputs); workspace units key on `blake3(own_src ‖ dep_output_hashes)` so a rebuild that produces an identical artifact doesn't move dependents' keys (see [Early cutoff](#early-cutoff))
 5. **Pipeline** — a `rustc` wrapper emits `metadata,link`, signals `__META_READY__` on fd 3 once the fat `.rmeta` exists, and the scheduler unblocks dependents before codegen finishes (cargo-style pipelining)
 
-On repeat builds only changed crates rebuild; unchanged crates are served from cache in ~0.1ms each. `-C incremental` further speeds up within-crate recompilation.
+On repeat builds only changed crates rebuild; `-C incremental` makes each rebuild fast, and early cutoff stops the rebuild from cascading past the point where outputs actually differ.
+
+## Early cutoff
+
+Cargo's freshness check is *input-mtime*: edit a deep crate → its `.rmeta` mtime bumps → every reverse-dep's check fails → rustc runs on each → their mtimes bump → all transitive revdeps rebuild. `-C incremental` makes each call cheap, but you still pay one rustc spawn per revdep, plus the leaf relinks.
+
+bob's tracked-unit cache key is *output-addressed*: `eff(c) = blake3(own_src(c) ‖ prop(d) for tracked d ∈ deps(c))`, where `prop(d)` is the hash of `d`'s **built output**, not its inputs. The scheduler computes `eff(c)` at the moment `c` becomes ready (once each `prop(d)` is known), and if `artifacts/<eff(c)>/` exists `c` is skipped entirely.
+
+For an edit at the bottom of a 20-deep revdep chain:
+
+1. The edited crate rebuilds.
+2. Its rmeta is hashed. If the public interface didn't change (comment, private body, formatting), the rmeta is byte-identical → every lib dependent's `eff` key is unchanged → all 19 intermediate crates cache-hit without spawning rustc.
+3. The leaf cdylib/bin re-links (its key folds in the edited crate's *rlib* bytes, which did change).
+
+If the edit *does* change the interface, the cascade runs until rmeta stabilises — typically one or two layers, not the full reachable set.
+
+### Two-tier propagation
+
+`prop(d)` is per-edge:
+
+- **lib→lib** uses `early_hash(d)` = `blake3(rmeta)`, taken at `__META_READY__`. rmeta is rustc's interface artifact and is byte-stable for unchanged inputs even under `-C incremental`, so cutoff fires for non-interface edits *and* the edge stays early-gated (pipelining preserved).
+- **→link** (cdylib/staticlib/bin/proc-macro) uses `out_hash(d)` = `blake3(full output)`, taken at commit. rlibs are *not* byte-stable across `-C incremental` session states, so keying the link on rmeta would be unsound — a stale `.so` could be served against a changed rlib. These edges are done-gated.
+
+cc units have no early signal yet, so cc→anything is done-gated on `out_hash`.
+
+### Trade-offs
+
+- **Hash on the critical path.** Each built unit's rmeta and full output are blake3'd before dependents can compute their key. ~3 GB/s; tens of ms on fat rlibs.
+- **Relies on rmeta determinism.** rustc gives no stability guarantee for `.rmeta`. Today it's byte-stable for equal inputs; if a future rustc embeds a nonce, lib→lib cutoff stops firing. The result is *slow*, not *wrong* (dependents rebuild and `-C incremental` does the work).
+- **Link targets always rebuild if any transitive rlib did.** rlibs aren't reproducible under `-C incremental`, so every leaf bin/cdylib re-links whenever anything upstream rebuilt. One fat `.so` is fine; many leaf binaries pay this per leaf.
+- **Precise invalidation = precise input model.** Cargo's blanket rebuild masks build scripts that read untracked state. `eff(c)` covers own sources, dep outputs, and the drv env (which already hashes declared `buildInputs`/flags); it does **not** cover ambient env a `build.rs` reads via `cargo:rerun-if-env-changed` — see [When to invalidate](#when-to-invalidate-manually).
+- **No sandbox, no remote.** Replay runs in your worktree with your env; out-hashes aren't portable across machines, and outputs aren't store-registered. This is a dev-loop accelerator; `nix build` stays the source of truth.
 
 ## Setup
 
@@ -75,10 +106,32 @@ Result symlinks follow nix-build: `result` → `$out`, `result-lib` → `$lib`; 
 
 All state lives under `$XDG_CACHE_HOME/bob/`:
 
-- `artifacts/<key>/{out,lib}` — build outputs
-- `incremental/<key>/` — rustc `-C incremental` state, persists across rebuilds
-- `eval/` — cached member → drv mappings
-- `tmp/`, `rmeta/`, `build/` — in-flight state
+- `artifacts/<key>/{out,lib,.out-hash,.early-hash}` — committed outputs plus the propagated hashes dependents key on. `<key>` is `blake3(drv_path)` for untracked units, `eff(c)` for tracked ones (so a tracked unit accumulates one entry per distinct source state it's been built at).
+- `incremental/<blake3(drv_path)>/` — rustc `-C incremental` session / cc build dir. Drv-path-keyed so source edits reuse it; toolchain/flag changes (which move the drv path) cold-start it.
+- `tmp/<blake3(drv_path)>/` — in-flight `$out`. Drv-path-keyed (not eff-keyed) so `$out` is stable across source edits — cmake/pkg-config/rpaths embed it, and `-C incremental`'s session inputs include it.
+- `eval/` — `nix-instantiate` results, keyed on `bob.nix` + lockfile + `eval-inputs`.
+- `rmeta/`, `build/` — in-flight pipelining state.
+
+### When to invalidate manually
+
+In normal use, never: source edits change `own_src` → new `eff` key; dep edits change `prop(d)` → new `eff` key; toolchain/flag/override changes change the drv path → new key for both tracked and untracked units *and* a fresh `incremental/` dir.
+
+The cases that need a manual `bob clean`:
+
+- **`build.rs` reads ambient state.** `cargo:rerun-if-env-changed=FOO` where `FOO` comes from your shell, not the drv env. Change `FOO` → bob serves the old artifact. `bob clean <crate>` (drops its incremental dir; next build re-runs `build.rs`) or set `FOO` via a crate override so it lands in the drv env and keys correctly.
+- **Non-hermetic cc unit.** A `CMakeLists.txt` that does `find_package` against a system path, or reads an env var the drv doesn't set. Same remedy.
+- **`-C incremental` corruption.** Rare rustc bug where the session state produces bad codegen after certain edits; symptoms are link errors or wrong behaviour that `nix build` doesn't reproduce. `bob clean <crate>` or `bob clean --incremental`.
+- **Disk pressure.** `artifacts/` grows by one entry per (tracked unit × distinct source state). `bob clean --all`.
+
+What the subcommands actually remove:
+
+| | `artifacts/` | `incremental/` | `eval/` |
+|---|:---:|:---:|:---:|
+| `bob clean <member>` | only the drv-keyed entry¹ | that member's | — |
+| `bob clean --incremental` | — | all | — |
+| `bob clean --all` | all | all | — |
+
+¹ Tracked units' eff-keyed `artifacts/` entries aren't individually addressable (there's one per source-hash, and the name→key mapping needs the source). They're harmless to keep; use `--all` to reclaim disk. The `eval/` cache self-invalidates on `bob.nix`/lockfile/`eval-inputs` changes; `rm -rf ~/.cache/bob/eval` if you need to force a re-instantiate without touching those.
 
 ## Crate layout
 
