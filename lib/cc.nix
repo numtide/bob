@@ -19,7 +19,7 @@
 #
 #   let bobCc = import "${bob}/lib/cc.nix"; in
 #   {
-#     workspaceMembers = …;
+#     rust = { inherit (cargoNix) workspaceMembers; };
 #     cc = bobCc.units {
 #       ndl = { drv = neuron.ndl; src = "extra-code/b16/aws-neuron-kmdlib"; };
 #     };

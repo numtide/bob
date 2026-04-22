@@ -1,5 +1,5 @@
 # Entry point for `bob build <member>` in this repo. bob runs
-# `nix-instantiate -E '(import <root>/bob.nix {}).workspaceMembers.<m>.build'`,
+# `nix-instantiate -E '(import <root>/bob.nix {}).rust.workspaceMembers.<m>.build'`,
 # so this must work standalone (no flake context). Pins for nixpkgs and
 # cargo-nix-plugin are read from flake.lock so there's a single source of
 # truth.
@@ -31,5 +31,5 @@ let
   };
 in
 {
-  inherit (cargoNix) workspaceMembers allWorkspaceMembers;
+  rust = { inherit (cargoNix) workspaceMembers allWorkspaceMembers; };
 }
