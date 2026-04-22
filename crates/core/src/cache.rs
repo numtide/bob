@@ -1,8 +1,10 @@
 //! Content-addressed artifact cache.
 //!
-//! Cache key = blake3(drv_path) — the drv path already encodes all inputs
-//! (source hash, dep hashes, compiler flags, feature selection) via Nix's
-//! own hashing.
+//! Untracked units key on `blake3(drv_path)` — the drv path already encodes
+//! all inputs (source hash, dep hashes, compiler flags, feature selection)
+//! via Nix's own hashing. Tracked (workspace) units key on the early-cutoff
+//! `eff` hash from [`crate::overrides::eff_hash`], which folds in dep
+//! *output* hashes; see `scheduler.rs` for where that's computed.
 //!
 //! Layout:
 //!   $XDG_CACHE_HOME/bob/
