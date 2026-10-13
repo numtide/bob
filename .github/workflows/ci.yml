@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: cachix/install-nix-action@v31
+      - uses: NixOS/nix-installer-action@main
       # Builds the `bob` package (buildRustPackage runs `cargo test` in
       # checkPhase) plus the fmt / core-leakage checks from flake.nix.
       - run: nix flake check --print-build-logs
@@ -25,7 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: cachix/install-nix-action@v31
+      - uses: NixOS/nix-installer-action@main
       - name: Build bootstrap bob + plugin-loaded nix-instantiate
         run: |
           nix build --print-build-logs --out-link bootstrap \
